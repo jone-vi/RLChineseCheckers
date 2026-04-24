@@ -144,7 +144,7 @@ class ChineseCheckersNet(nn.Module):
         obs:         np.ndarray,
         action_mask: np.ndarray,
         temperature: float = 1.0,
-        device:      str   = "cpu",
+        device=None,
     ) -> int:
         """
         Single-step action selection for deployment / evaluation.
@@ -153,10 +153,13 @@ class ChineseCheckersNet(nn.Module):
             obs:         float32 array [1089]
             action_mask: int8 array [1210]
             temperature: 0.0 = argmax (greedy), >0 = sample
+            device:      torch device to use (default: inferred from model weights)
 
         Returns:
             Encoded action integer (0–1209).
         """
+        if device is None:
+            device = next(self.parameters()).device
         obs_t  = torch.from_numpy(obs).float().unsqueeze(0).to(device)
         mask_t = torch.from_numpy(action_mask).float().unsqueeze(0).to(device)
 

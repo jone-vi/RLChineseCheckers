@@ -144,6 +144,7 @@ def train(
     ckpt_dir: str = "checkpoints",
     max_steps: int = MAX_STEPS,
     device: str = None,
+    resume: str = None,
 ) -> None:
     # -- Device --
     if device is None:
@@ -156,20 +157,32 @@ def train(
     dev = torch.device(device)
     print(f"Device: {dev}")
 
-    # -- Load Stage 1 weights --
-    ckpt_path = _ROOT / stage1_ckpt
-    if not ckpt_path.exists():
-        raise FileNotFoundError(
-            f"Stage 1 checkpoint not found: {ckpt_path}\n"
-            "Run supervised.py first."
-        )
-    ckpt = torch.load(ckpt_path, map_location=dev)
+    # -- Load weights (resume from PPO checkpoint or start from Stage 1) --
     net = ChineseCheckersNet().to(dev)
-    net.load_state_dict(ckpt["state_dict"])
-    net.train()
-    print(f"Loaded Stage 1 weights (epoch {ckpt.get('epoch', '?')})")
-
     optimiser = torch.optim.Adam(net.parameters(), lr=LR)
+    resume_step = 0
+
+    if resume:
+        resume_path = _ROOT / resume
+        if not resume_path.exists():
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
+        ckpt = torch.load(resume_path, map_location=dev, weights_only=False)
+        net.load_state_dict(ckpt["state_dict"])
+        optimiser.load_state_dict(ckpt["optimiser"])
+        resume_step = ckpt.get("step", 0)
+        net.train()
+        print(f"Resumed from {resume_path.name} at step {resume_step:,}")
+    else:
+        ckpt_path = _ROOT / stage1_ckpt
+        if not ckpt_path.exists():
+            raise FileNotFoundError(
+                f"Stage 1 checkpoint not found: {ckpt_path}\n"
+                "Run supervised.py first."
+            )
+        ckpt = torch.load(ckpt_path, map_location=dev, weights_only=False)
+        net.load_state_dict(ckpt["state_dict"])
+        net.train()
+        print(f"Loaded Stage 1 weights (epoch {ckpt.get('epoch', '?')})")
 
     # -- Environments --
     envs = [ChineseCheckersEnv(n_players=2) for _ in range(N_ENVS)]
@@ -202,10 +215,10 @@ def train(
     # -- Tracking --
     ckpt_save_dir = _ROOT / ckpt_dir
     ckpt_save_dir.mkdir(parents=True, exist_ok=True)
-    global_step = 0
+    global_step = resume_step
     rollout_count = 0
-    last_ckpt_step = 0
-    last_eval_step = 0
+    last_ckpt_step = resume_step
+    last_eval_step = resume_step
     ep_wins: list[float] = []     # rolling window: 1=win, 0=loss for learning net
     ep_rewards: list[float] = []  # rolling window: per-episode total reward
 
@@ -513,6 +526,8 @@ def _parse():
     p.add_argument("--ckpt-dir", type=str, default="checkpoints")
     p.add_argument("--max-steps", type=int, default=MAX_STEPS)
     p.add_argument("--device", type=str, default=None)
+    p.add_argument("--resume", type=str, default=None,
+                   help="Resume from a PPO checkpoint, e.g. checkpoints/ppo_step_100352.pt")
     return p.parse_args()
 
 
@@ -523,4 +538,5 @@ if __name__ == "__main__":
         ckpt_dir=args.ckpt_dir,
         max_steps=args.max_steps,
         device=args.device,
+        resume=args.resume,
     )
