@@ -221,6 +221,7 @@ def train(
     last_eval_step = resume_step
     ep_wins: list[float] = []     # rolling window: 1=win, 0=loss for learning net
     ep_rewards: list[float] = []  # rolling window: per-episode total reward
+    ep_term_types: list[str] = [] # rolling window: "win", "loss", "cycle", "limit"
 
     # Per-env episode reward accumulator
     ep_rew_accum = [0.0] * N_ENVS
@@ -270,7 +271,8 @@ def train(
                             _on_episode_end(
                                 e, env, envs, obs_buf, info_buf,
                                 opponents, is_selfplay, pool, net,
-                                ep_wins, ep_rewards, ep_rew_accum, next_info,
+                                ep_wins, ep_rewards, ep_rew_accum, ep_term_types,
+                                next_info, done, trunc,
                             )
                         continue
 
@@ -321,7 +323,8 @@ def train(
                         _on_episode_end(
                             e, env, envs, obs_buf, info_buf,
                             opponents, is_selfplay, pool, net,
-                            ep_wins, ep_rewards, ep_rew_accum, next_info,
+                            ep_wins, ep_rewards, ep_rew_accum, ep_term_types,
+                            next_info, done, trunc,
                         )
 
                 else:
@@ -335,7 +338,8 @@ def train(
                         _on_episode_end(
                             e, env, envs, obs_buf, info_buf,
                             opponents, is_selfplay, pool, net,
-                            ep_wins, ep_rewards, ep_rew_accum, next_info,
+                            ep_wins, ep_rewards, ep_rew_accum, ep_term_types,
+                            next_info, done, trunc,
                         )
 
         # ----------------------------------------------------------------
@@ -447,6 +451,12 @@ def train(
             recent_win = np.mean(ep_wins[-100:]) if ep_wins else 0.0
             recent_rew = np.mean(ep_rewards[-100:]) if ep_rewards else 0.0
             elapsed = time.perf_counter() - t_start
+            recent_types = ep_term_types[-100:]
+            n_recent = max(len(recent_types), 1)
+            pct_win   = recent_types.count("win")   / n_recent
+            pct_loss  = recent_types.count("loss")  / n_recent
+            pct_cycle = recent_types.count("cycle") / n_recent
+            pct_limit = recent_types.count("limit") / n_recent
             print(
                 f"step={global_step:>9,}"
                 f" | win={recent_win:.3f}"
@@ -454,6 +464,7 @@ def train(
                 f" | p_loss={sum_p_loss / max(n_updates, 1):.4f}"
                 f" | v_loss={sum_v_loss / max(n_updates, 1):.4f}"
                 f" | ent={sum_ent / max(n_updates, 1):.4f}"
+                f" | term: W={pct_win:.0%} L={pct_loss:.0%} cyc={pct_cycle:.0%} lim={pct_limit:.0%}"
                 f" | {elapsed / 3600:.2f}h"
             )
 
@@ -501,14 +512,29 @@ def _on_episode_end(
     ep_wins: list,
     ep_rewards: list,
     ep_rew_accum: list,
+    ep_term_types: list,
     info: dict,
+    terminated: bool,
+    truncated: bool,
 ) -> None:
     """Reset env, sample new opponent, record win/reward statistics."""
     rewards = info.get("rewards", {})
-    win = float(rewards.get("red", 0.0) > rewards.get("blue", 0.0))
+    red_r = rewards.get("red", 0.0)
+    blue_r = rewards.get("blue", 0.0)
+    win = float(red_r > blue_r)
     ep_wins.append(win)
     ep_rewards.append(ep_rew_accum[e])
     ep_rew_accum[e] = 0.0
+
+    if truncated:
+        term_type = "limit"
+    elif red_r == 10.0:
+        term_type = "win"
+    elif blue_r == 10.0:
+        term_type = "loss"
+    else:
+        term_type = "cycle"
+    ep_term_types.append(term_type)
 
     obs_buf[e], info_buf[e] = envs[e].reset()
     opp = pool.sample_opponent(net, mix_ratio=0.3)
