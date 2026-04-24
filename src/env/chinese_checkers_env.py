@@ -96,6 +96,7 @@ class ChineseCheckersEnv(gymnasium.Env):
         self._prev_dist_sq:      Dict[str, float]   = {}
         self._pins_entered_goal: Dict[str, Set[int]]= {}
         self._state_hash_counts: Dict[int, int]     = {}
+        self._player_pos_counts: Dict[str, Dict[int, int]] = {}
 
     # -----------------------------------------------------------------------
     # Gymnasium API
@@ -110,6 +111,7 @@ class ChineseCheckersEnv(gymnasium.Env):
         self._still_playing      = list(self._active_colours)
         self._pins_entered_goal  = {c: set() for c in self._active_colours}
         self._state_hash_counts  = {}
+        self._player_pos_counts  = {c: {} for c in self._active_colours}
 
         # Compute D_max from starting positions to deepest goal cell
         for colour in self._active_colours:
@@ -174,7 +176,13 @@ class ChineseCheckersEnv(gymnasium.Env):
             truncated = True
 
         else:
-            rewards[acting] += self._shaping_reward(acting, d_before, d_after, h)
+            p_hash = self._player_pos_hash(acting)
+            self._player_pos_counts[acting][p_hash] = (
+                self._player_pos_counts[acting].get(p_hash, 0) + 1
+            )
+            rewards[acting] += self._shaping_reward(
+                acting, d_before, d_after, self._player_pos_counts[acting][p_hash]
+            )
             self._advance_turn()
             # Skip over any players with no legal moves (e.g. all pins in goal
             # zone and no deeper empty cells).  Loop up to n_players-1 times so
@@ -315,8 +323,12 @@ class ChineseCheckersEnv(gymnasium.Env):
                 mask[pin_id * self.N_CELLS + dest] = 1
         return mask
 
+    def _player_pos_hash(self, colour: str) -> int:
+        """Hash of this player's own piece positions only, for per-player cycle detection."""
+        return hash(tuple(sorted(p.axialindex for p in self._pins[colour])))
+
     def _shaping_reward(self, colour: str, d_before: float,
-                        d_after: float, h: int) -> float:
+                        d_after: float, pos_count: int) -> float:
         r = 0.0
 
         # 1. Distance reduction: positive when pins moved closer to goal
@@ -337,9 +349,11 @@ class ChineseCheckersEnv(gymnasium.Env):
         ]
         r -= 0.01 * float(np.std(projs))
 
-        # 4. Stagnation: penalise repeated board states
-        if self._state_hash_counts[h] > 1:
-            r -= 0.05
+        # 4. Stagnation: penalise if THIS player's own pieces returned to a prior
+        #    configuration.  Per-player tracking fires even when the opponent moves
+        #    forward (unlike full-board hash which only fires in pure self-play cycles).
+        if pos_count > 1:
+            r -= 0.5
 
         return r
 
