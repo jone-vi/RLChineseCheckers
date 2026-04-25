@@ -44,11 +44,12 @@ ROLLOUT_STEPS = 128          # steps per env per update → ~1024 transitions
 GAMMA = 0.99
 GAE_LAMBDA = 0.95
 CLIP_EPS = 0.2
-ENT_COEF = 0.003
+ENT_COEF = 0.0001            # was 0.003 — high entropy coef spread the policy faster than PPO could improve it
 VF_COEF = 0.5
-LR = 3e-4
-N_EPOCHS = 1                 # PPO update epochs per rollout batch
+LR = 1e-4                    # was 3e-4 — lower LR preserves Stage 1 knowledge during fine-tuning
+N_EPOCHS = 4                 # was 1 — offset the lower LR with more gradient steps per rollout
 MINIBATCH = 64
+TARGET_KL = 0.01             # stop epoch early if policy changes too much
 MAX_STEPS = 5_000_000
 REWARD_SCALE = 10.0          # divide raw rewards; terminal win→+1, loss→-1
 CKPT_EVERY = 100_000
@@ -380,8 +381,10 @@ def train(
         ret_batch = torch.tensor(all_returns, dtype=torch.float32).to(dev)
         masks_batch = torch.from_numpy(np.array(all_masks)).to(dev)
 
-        # Normalise advantages over the full batch
+        # Normalise advantages over the full batch; clip to ±5 to prevent
+        # degenerate amplification when returns are compressed (std near zero).
         adv_batch = (adv_batch - adv_batch.mean()) / (adv_batch.std() + 1e-8)
+        adv_batch = adv_batch.clamp(-5.0, 5.0)
 
         # ----------------------------------------------------------------
         # PPO UPDATE
@@ -392,8 +395,11 @@ def train(
         sum_v_loss = 0.0
         sum_ent = 0.0
         n_updates = 0
+        kl_exceeded = False
 
         for _ in range(N_EPOCHS):
+            if kl_exceeded:
+                break
             indices = torch.randperm(B, device=dev)
             for start in range(0, B, MINIBATCH):
                 idx = indices[start : start + MINIBATCH]
@@ -433,6 +439,13 @@ def train(
                 sum_v_loss += value_loss.item()
                 sum_ent += entropy_loss.item()
                 n_updates += 1
+
+                # KL early stopping: approximate KL = mean(log π_old - log π_new)
+                with torch.no_grad():
+                    approx_kl = (logprobs_batch[idx] - new_lp).mean().item()
+                if approx_kl > TARGET_KL:
+                    kl_exceeded = True
+                    break
 
         rollout_count += 1
 
