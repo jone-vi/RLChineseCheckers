@@ -53,12 +53,18 @@ POLICY_RAMPUP_ROLLOUTS = 400  # rollouts after value warmup before encoder is un
                              #     shift policy head outputs even without policy gradient, bypassing clip+KL)
                              #   full training: everything unfrozen, clip=0.1
 ENT_COEF = 0.0001            # was 0.003 — high entropy coef spread the policy faster than PPO could improve it
-ENT_PENALTY_COEF = 0.05      # penalty for entropy exceeding MAX_ENT (raised from 0.01 — was too weak)
-MAX_ENT = 2.0                # entropy ceiling — above this the policy is too diffuse to win reliably
+ENT_PENALTY_COEF = 2.0       # at entropy=1.4 (above ceiling 1.2): penalty=2.0×0.2=0.4, which is 4-8× the
+                             # typical policy_loss of 0.05-0.1 — this actually enforces the ceiling.
+                             # 0.05 was too weak: at entropy=2.5, penalty=0.025 vs policy_loss=0.1 → ignored.
+MAX_ENT = 1.2                # sweet spot empirically: win=84-93% at entropy 0.5-1.2, collapses above 1.5.
+                             # was 2.0 — the policy drifted through 2.0 with no resistance.
 VF_COEF = 0.5
 LR = 1e-4                    # was 3e-4 — lower LR preserves Stage 1 knowledge during fine-tuning
-N_EPOCHS = 1                 # 4 epochs × 16 minibatches = 64 steps per rollout was too many; value head
-                             # can't track the policy when it changes this fast from a concentrated start
+N_EPOCHS = 1                 # policy epochs per rollout — deliberately 1 to prevent large policy drift
+N_VALUE_EXTRA = 3            # additional value-head-only epochs per rollout (encoder+policy frozen).
+                             # v_loss oscillated 0.07-0.17 throughout rampup because the policy changes every
+                             # rollout and 1 epoch of value updates can't track it; extra epochs hold it low,
+                             # producing accurate advantages and preventing the noisy-grad→entropy-drift loop.
 MINIBATCH = 64
 TARGET_KL = 0.01             # stop epoch early if policy changes too much
 POOL_MIX_RATIO = 1.0         # all games vs pool (Stage 1 + heuristic + promoted checkpoints); no self-play
@@ -503,6 +509,30 @@ def train(
                 if approx_kl > TARGET_KL:
                     kl_exceeded = True
                     break
+
+        # Extra value-head calibration epochs: encoder and policy head frozen so these
+        # updates only move the value head.  This keeps v_loss low even as the policy
+        # changes each rollout, giving accurate advantages for the next update.
+        net.encoder.requires_grad_(False)
+        net.policy_head.requires_grad_(False)
+        for _ in range(N_VALUE_EXTRA):
+            v_idx = torch.randperm(B, device=dev)
+            for start in range(0, B, MINIBATCH):
+                idx = v_idx[start : start + MINIBATCH]
+                if len(idx) < 2:
+                    continue
+                _, _, _, extra_val = net.get_action_and_value(
+                    obs_batch[idx], masks_batch[idx], action=actions_batch[idx]
+                )
+                extra_v_loss = nn.functional.mse_loss(
+                    extra_val, ret_batch[idx].clamp(-1.0, 1.0)
+                )
+                optimiser.zero_grad()
+                (VF_COEF * extra_v_loss).backward()
+                nn.utils.clip_grad_norm_(net.parameters(), max_norm=0.5)
+                optimiser.step()
+        net.encoder.requires_grad_(not in_encoder_freeze)
+        net.policy_head.requires_grad_(not in_warmup)
 
         rollout_count += 1
 
