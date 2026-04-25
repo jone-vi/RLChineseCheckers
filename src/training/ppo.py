@@ -412,6 +412,14 @@ def train(
         if rollout_count == WARMUP_ROLLOUTS + 1:
             print(f"[Warmup] Value calibration complete at step {global_step:,} — policy updates enabled")
 
+        # Freeze encoder+policy head during warmup so encoder gradient from value_loss
+        # cannot corrupt the policy.  Zeroing policy_loss alone is not enough: the shared
+        # encoder still receives value gradient, its weights drift, and policy head outputs
+        # change even though policy head weights don't.  requires_grad_(False) stops all
+        # gradient accumulation for those parameters while allowing forward passes.
+        net.encoder.requires_grad_(not in_warmup)
+        net.policy_head.requires_grad_(not in_warmup)
+
         for _ in range(N_EPOCHS):
             if kl_exceeded:
                 break
