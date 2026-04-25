@@ -45,19 +45,25 @@ GAMMA = 0.99
 GAE_LAMBDA = 0.95
 CLIP_EPS = 0.1               # fine-tuning from pretrained policy: 0.1, not 0.2
 CLIP_EPS_START = 0.01        # start even tighter; ramp to CLIP_EPS over POLICY_RAMPUP_ROLLOUTS
-POLICY_RAMPUP_ROLLOUTS = 50   # rollouts after value warmup before encoder is unfrozen and clip hits CLIP_EPS
+POLICY_RAMPUP_ROLLOUTS = 200  # rollouts after value warmup before encoder is unfrozen and clip hits CLIP_EPS
                              # Phase sequence:
                              #   warmup (WARMUP_ROLLOUTS): encoder+policy frozen, value head calibrates
                              #   rampup (POLICY_RAMPUP_ROLLOUTS): policy head unfrozen, encoder still frozen,
                              #     clip ramps 0.01→0.1  — prevents encoder-coupling drift (encoder changes
                              #     shift policy head outputs even without policy gradient, bypassing clip+KL)
                              #   full training: everything unfrozen, clip=0.1
+                             # Previously 50 rollouts = 8× faster ramp than the run that reached win=93%.
+                             # At rollout 38 (clip=0.080) win rate collapsed; 200 rollouts keeps clip<0.027
+                             # at the same point in training.
 ENT_COEF = 0.0001            # was 0.003 — high entropy coef spread the policy faster than PPO could improve it
-ENT_PENALTY_COEF = 2.0       # at entropy=1.4 (above ceiling 1.2): penalty=2.0×0.2=0.4, which is 4-8× the
+ENT_PENALTY_COEF = 2.0       # at entropy=0.8 (above ceiling 0.7): penalty=2.0×0.1=0.2, which is 2-4× the
                              # typical policy_loss of 0.05-0.1 — this actually enforces the ceiling.
                              # 0.05 was too weak: at entropy=2.5, penalty=0.025 vs policy_loss=0.1 → ignored.
-MAX_ENT = 1.2                # sweet spot empirically: win=84-93% at entropy 0.5-1.2, collapses above 1.5.
-                             # was 2.0 — the policy drifted through 2.0 with no resistance.
+MAX_ENT = 0.7                # ceiling set just above observed collapse threshold: win rate dropped at
+                             # entropy=0.66 with MAX_ENT=1.2 — the penalty never fired (1.2>0.66, penalty=0).
+                             # 0.7 ensures penalty activates before the policy degrades.
+                             # was 1.2 — empirically the good zone is 0.3-0.7 during rampup; 1.2 was above
+                             # the failure threshold so gave zero protection.
 VF_COEF = 0.5
 LR = 1e-4                    # was 3e-4 — lower LR preserves Stage 1 knowledge during fine-tuning
 N_EPOCHS = 1                 # policy epochs per rollout — deliberately 1 to prevent large policy drift
@@ -68,9 +74,10 @@ N_VALUE_EXTRA = 3            # additional value-head-only epochs per rollout (en
 MINIBATCH = 64
 TARGET_KL = 0.01             # stop epoch early if policy changes too much
 POOL_MIX_RATIO = 1.0         # all games vs pool (Stage 1 + heuristic + promoted checkpoints); no self-play
-WARMUP_ROLLOUTS = 50          # ~50K steps: freeze policy, let value head calibrate on real game dynamics
+WARMUP_ROLLOUTS = 100         # ~100K steps: freeze policy, let value head calibrate on real game dynamics
                              # before policy updates begin (Stage 1 value head trained on heuristic games,
                              # not Stage 1 self-play — mispredictions create huge noisy advantages otherwise)
+                             # was 50 — value head needs more time to reach v_loss<0.03 stably
 MAX_STEPS = 5_000_000
 REWARD_SCALE = 10.0          # divide raw rewards; terminal win→+1, loss→-1
 CKPT_EVERY = 100_000
