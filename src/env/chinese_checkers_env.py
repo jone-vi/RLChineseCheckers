@@ -158,21 +158,15 @@ class ChineseCheckersEnv(gymnasium.Env):
         truncated  = False
 
         if self._check_win(acting):
-            N = self.n_players
             rewards[acting] = 10.0
-            for c in self._active_colours:
-                if c != acting:
-                    rewards[c] = -10.0 / (N - 1)
+            # Non-winners keep default 0.0 — no loss penalty
             terminated = True
 
-        elif self._state_hash_counts[h] >= 5:
-            for c in self._active_colours:
-                rewards[c] = -2.0
+        elif self._state_hash_counts[h] >= 20:
+            # Safety valve for extremely cyclic games; no explicit penalty
             terminated = True
 
         elif all(self._move_counts[c] >= 200 for c in self._active_colours):
-            for c in self._active_colours:
-                rewards[c] = -2.0
             truncated = True
 
         else:
@@ -192,9 +186,14 @@ class ChineseCheckersEnv(gymnasium.Env):
                     break
                 self._advance_turn()
             else:
-                for c in self._active_colours:
-                    rewards[c] = -2.0
                 terminated = True
+
+        if terminated or truncated:
+            for c in self._active_colours:
+                final_dist = self._prev_dist_sq[c]
+                initial_dist = self._d_max[c]
+                progress = (initial_dist - final_dist) / max(initial_dist, 1.0)
+                rewards[c] += 1.0 * progress
 
         obs  = self._build_observation()
         mask = self._build_action_mask()
@@ -341,19 +340,6 @@ class ChineseCheckersEnv(gymnasium.Env):
                     and pin_id not in self._pins_entered_goal[colour]):
                 r += 0.2
                 self._pins_entered_goal[colour].add(pin_id)
-
-        # 3. Cohesion penalty: σ of pin positions projected onto diagonal (q+r)
-        projs = [
-            self._board.cells[p.axialindex].q + self._board.cells[p.axialindex].r
-            for p in self._pins[colour]
-        ]
-        r -= 0.01 * float(np.std(projs))
-
-        # 4. Stagnation: penalise if THIS player's own pieces returned to a prior
-        #    configuration.  Per-player tracking fires even when the opponent moves
-        #    forward (unlike full-board hash which only fires in pure self-play cycles).
-        if pos_count > 1:
-            r -= 0.1
 
         return r
 

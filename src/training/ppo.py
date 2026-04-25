@@ -16,6 +16,7 @@ Exploration schedule per game:
 Usage:
     python -m src.training.ppo
     python -m src.training.ppo --max-steps 50000 --device cpu   # smoke test
+    python -m src.training.ppo --max-steps 1000 --debug          # dense logging
 """
 
 import argparse
@@ -46,7 +47,7 @@ CLIP_EPS = 0.2
 ENT_COEF = 0.003
 VF_COEF = 0.5
 LR = 3e-4
-N_EPOCHS = 4                 # PPO update epochs per rollout batch
+N_EPOCHS = 1                 # PPO update epochs per rollout batch
 MINIBATCH = 64
 MAX_STEPS = 5_000_000
 REWARD_SCALE = 10.0          # divide raw rewards; terminal win→+1, loss→-1
@@ -136,6 +137,7 @@ def train(
     max_steps: int = MAX_STEPS,
     device: str = None,
     resume: str = None,
+    debug: bool = False,
 ) -> None:
     # -- Device --
     if device is None:
@@ -193,7 +195,7 @@ def train(
 
     for e in range(N_ENVS):
         obs_buf[e], info_buf[e] = envs[e].reset()
-        mix = 1.0 if global_step < 500_000 else 0.3
+        mix = 0.3
         opp = pool.sample_opponent(net, mix_ratio=mix)
         opponents[e] = opp
         is_selfplay[e] = (opp is net)
@@ -246,7 +248,7 @@ def train(
                 mask = info["action_mask"]
 
                 colour = env._active_colours[env._turn_idx]
-                is_learning = is_selfplay[e] or (env._turn_idx == 0)
+                is_learning = (env._turn_idx == 0)
 
                 if is_learning:
                     move_count = env._move_counts[colour]
@@ -305,13 +307,20 @@ def train(
                         )
 
                 else:
-                    # Pool opponent acts — no buffer storage
+                    # Opponent acts — no buffer storage
                     action = opponents[e].act(env)
                     next_obs, raw_r, done, trunc, next_info = env.step(action)
                     global_step += 1
                     obs_buf[e] = next_obs
                     info_buf[e] = next_info
                     if done or trunc:
+                        # Credit P0's last stored transition with the terminal outcome.
+                        # P0 doesn't act again, so this is the only way it receives
+                        # its loss/draw reward from the opponent ending the game.
+                        if per_env_rewards[e]:
+                            red_final = next_info["rewards"].get("red", 0.0) / REWARD_SCALE
+                            per_env_rewards[e][-1] += red_final
+                            per_env_dones[e][-1] = 1.0
                         _on_episode_end(
                             e, env, envs, obs_buf, info_buf,
                             opponents, is_selfplay, pool, net,
@@ -404,7 +413,12 @@ def train(
                 surr2 = torch.clamp(ratio, 1.0 - CLIP_EPS, 1.0 + CLIP_EPS) * adv_mb
                 policy_loss = -torch.min(surr1, surr2).mean()
 
-                value_loss = nn.functional.mse_loss(new_val, ret_batch[idx])
+                # Clamp returns to value head's range so Tanh can represent them.
+                # Accumulated shaping rewards can push returns outside [-1, 1];
+                # clamping keeps value targets valid without changing policy gradient.
+                value_loss = nn.functional.mse_loss(
+                    new_val, ret_batch[idx].clamp(-1.0, 1.0)
+                )
 
                 entropy_loss = ent.mean()
 
@@ -425,7 +439,8 @@ def train(
         # ----------------------------------------------------------------
         # LOGGING
         # ----------------------------------------------------------------
-        if rollout_count % 10 == 0:
+        log_every = 1 if debug else 10
+        if rollout_count % log_every == 0:
             recent_win = np.mean(ep_wins[-100:]) if ep_wins else 0.0
             recent_rew = np.mean(ep_rewards[-100:]) if ep_rewards else 0.0
             elapsed = time.perf_counter() - t_start
@@ -435,16 +450,35 @@ def train(
             pct_loss  = recent_types.count("loss")  / n_recent
             pct_cycle = recent_types.count("cycle") / n_recent
             pct_limit = recent_types.count("limit") / n_recent
+            p_loss_avg = sum_p_loss / max(n_updates, 1)
+            v_loss_avg = sum_v_loss / max(n_updates, 1)
+            ent_avg = sum_ent / max(n_updates, 1)
             print(
                 f"step={global_step:>9,}"
                 f" | win={recent_win:.3f}"
                 f" | rew={recent_rew:.3f}"
-                f" | p_loss={sum_p_loss / max(n_updates, 1):.4f}"
-                f" | v_loss={sum_v_loss / max(n_updates, 1):.4f}"
-                f" | ent={sum_ent / max(n_updates, 1):.4f}"
+                f" | p_loss={p_loss_avg:.4f}"
+                f" | v_loss={v_loss_avg:.4f}"
+                f" | ent={ent_avg:.4f}"
                 f" | term: W={pct_win:.0%} L={pct_loss:.0%} cyc={pct_cycle:.0%} lim={pct_limit:.0%}"
                 f" | {elapsed / 3600:.2f}h"
             )
+            if debug and len(all_advantages) > 0:
+                raw_adv = np.array(all_advantages)
+                raw_ret = np.array(all_returns)
+                val_arr = np.array([v for vs in per_env_values for v in vs])
+                print(
+                    f"  [debug] adv_raw  mean={raw_adv.mean():.3f} std={raw_adv.std():.3f}"
+                    f" min={raw_adv.min():.3f} max={raw_adv.max():.3f}"
+                )
+                print(
+                    f"  [debug] returns  mean={raw_ret.mean():.3f} std={raw_ret.std():.3f}"
+                    f" min={raw_ret.min():.3f} max={raw_ret.max():.3f}"
+                )
+                print(
+                    f"  [debug] val_pred mean={val_arr.mean():.3f} std={val_arr.std():.3f}"
+                    f" min={val_arr.min():.3f} max={val_arr.max():.3f}"
+                )
 
         # ----------------------------------------------------------------
         # CHECKPOINT + POOL PROMOTION (every CKPT_EVERY steps)
@@ -507,16 +541,16 @@ def _on_episode_end(
 
     if truncated:
         term_type = "limit"
-    elif red_r == 10.0:
+    elif red_r >= 10.0:
         term_type = "win"
-    elif blue_r == 10.0:
+    elif blue_r >= 10.0:
         term_type = "loss"
     else:
         term_type = "cycle"
     ep_term_types.append(term_type)
 
     obs_buf[e], info_buf[e] = envs[e].reset()
-    mix = 0.5 if global_step < 500_000 else 0.3
+    mix = 0.3
     opp = pool.sample_opponent(net, mix_ratio=mix)
     opponents[e] = opp
     is_selfplay[e] = (opp is net)
@@ -534,6 +568,8 @@ def _parse():
     p.add_argument("--device", type=str, default=None)
     p.add_argument("--resume", type=str, default=None,
                    help="Resume from a PPO checkpoint, e.g. checkpoints/ppo_step_100352.pt")
+    p.add_argument("--debug", action="store_true",
+                   help="Log every rollout with value/return/advantage diagnostics")
     return p.parse_args()
 
 
@@ -545,4 +581,5 @@ if __name__ == "__main__":
         max_steps=args.max_steps,
         device=args.device,
         resume=args.resume,
+        debug=args.debug,
     )
