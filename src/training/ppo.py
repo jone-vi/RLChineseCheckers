@@ -54,6 +54,9 @@ N_EPOCHS = 1                 # 4 epochs × 16 minibatches = 64 steps per rollout
 MINIBATCH = 64
 TARGET_KL = 0.01             # stop epoch early if policy changes too much
 POOL_MIX_RATIO = 1.0         # all games vs pool (Stage 1 + heuristic + promoted checkpoints); no self-play
+WARMUP_ROLLOUTS = 50         # ~50K steps: freeze policy, let value head calibrate on real game dynamics
+                             # before policy updates begin (Stage 1 value head trained on heuristic games,
+                             # not Stage 1 self-play — mispredictions create huge noisy advantages otherwise)
 MAX_STEPS = 5_000_000
 REWARD_SCALE = 10.0          # divide raw rewards; terminal win→+1, loss→-1
 CKPT_EVERY = 100_000
@@ -405,6 +408,10 @@ def train(
         n_updates = 0
         kl_exceeded = False
 
+        in_warmup = rollout_count <= WARMUP_ROLLOUTS
+        if rollout_count == WARMUP_ROLLOUTS + 1:
+            print(f"[Warmup] Value calibration complete at step {global_step:,} — policy updates enabled")
+
         for _ in range(N_EPOCHS):
             if kl_exceeded:
                 break
@@ -440,7 +447,15 @@ def train(
                 # Keeps the policy diverse enough to explore but not so random it loses signal.
                 ent_reg = (-ENT_COEF * entropy_loss
                            + ENT_PENALTY_COEF * torch.clamp(entropy_loss - MAX_ENT, min=0.0))
-                loss = policy_loss + VF_COEF * value_loss + ent_reg
+
+                # During warmup: only update value head so it can calibrate on real game dynamics.
+                # Policy gradient is frozen — Stage 1 value head was trained on heuristic games and
+                # mispredicts returns in Stage 1 self-play, producing large noisy advantages that
+                # corrupt the policy in the very first rollout if left unchecked.
+                if in_warmup:
+                    loss = VF_COEF * value_loss
+                else:
+                    loss = policy_loss + VF_COEF * value_loss + ent_reg
 
                 optimiser.zero_grad()
                 loss.backward()
