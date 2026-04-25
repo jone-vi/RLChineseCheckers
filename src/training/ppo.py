@@ -45,13 +45,15 @@ GAMMA = 0.99
 GAE_LAMBDA = 0.95
 CLIP_EPS = 0.2
 ENT_COEF = 0.0001            # was 0.003 — high entropy coef spread the policy faster than PPO could improve it
-ENT_PENALTY_COEF = 0.01      # penalty for entropy exceeding MAX_ENT; 100× stronger than the bonus
+ENT_PENALTY_COEF = 0.05      # penalty for entropy exceeding MAX_ENT (raised from 0.01 — was too weak)
 MAX_ENT = 2.0                # entropy ceiling — above this the policy is too diffuse to win reliably
 VF_COEF = 0.5
 LR = 1e-4                    # was 3e-4 — lower LR preserves Stage 1 knowledge during fine-tuning
-N_EPOCHS = 4                 # was 1 — offset the lower LR with more gradient steps per rollout
+N_EPOCHS = 1                 # 4 epochs × 16 minibatches = 64 steps per rollout was too many; value head
+                             # can't track the policy when it changes this fast from a concentrated start
 MINIBATCH = 64
 TARGET_KL = 0.01             # stop epoch early if policy changes too much
+POOL_MIX_RATIO = 1.0         # all games vs pool (Stage 1 + heuristic + promoted checkpoints); no self-play
 MAX_STEPS = 5_000_000
 REWARD_SCALE = 10.0          # divide raw rewards; terminal win→+1, loss→-1
 CKPT_EVERY = 100_000
@@ -186,6 +188,11 @@ def train(
     # -- Opponent pool --
     heuristic = HeuristicAgent(seed=42)
     pool = OpponentPool(heuristic_agent=heuristic, pool_size=5, ckpt_dir=ckpt_dir)
+    # Seed the pool with Stage 1 so there is a stable frozen opponent from step 0.
+    # Without this the pool is empty for the first 100K steps and 70% of games are
+    # pure self-play against the same network that is currently degrading.
+    if not resume:
+        pool.add(net.state_dict(), step=0)
 
     # -- Tracking (global_step needed before env init for mix_ratio) --
     global_step = resume_step
@@ -198,8 +205,7 @@ def train(
 
     for e in range(N_ENVS):
         obs_buf[e], info_buf[e] = envs[e].reset()
-        mix = 0.3
-        opp = pool.sample_opponent(net, mix_ratio=mix)
+        opp = pool.sample_opponent(net, mix_ratio=POOL_MIX_RATIO)
         opponents[e] = opp
         is_selfplay[e] = (opp is net)
 
@@ -569,8 +575,7 @@ def _on_episode_end(
     ep_term_types.append(term_type)
 
     obs_buf[e], info_buf[e] = envs[e].reset()
-    mix = 0.3
-    opp = pool.sample_opponent(net, mix_ratio=mix)
+    opp = pool.sample_opponent(net, mix_ratio=POOL_MIX_RATIO)
     opponents[e] = opp
     is_selfplay[e] = (opp is net)
 
