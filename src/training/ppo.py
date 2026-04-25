@@ -78,6 +78,10 @@ WARMUP_ROLLOUTS = 100         # ~100K steps: freeze policy, let value head calib
                              # before policy updates begin (Stage 1 value head trained on heuristic games,
                              # not Stage 1 self-play — mispredictions create huge noisy advantages otherwise)
                              # was 50 — value head needs more time to reach v_loss<0.03 stably
+CYCLE_TERMINAL_PENALTY = 1.0  # raw units; /REWARD_SCALE = -0.10 scaled.
+                               # Cycles previously matched loss reward (+0.01-0.03), giving the
+                               # agent no incentive to avoid them against strong pool opponents.
+                               # Now cycles < losses < wins, removing the rational cycle strategy.
 MAX_STEPS = 5_000_000
 REWARD_SCALE = 10.0          # divide raw rewards; terminal win→+1, loss→-1
 CKPT_EVERY = 100_000
@@ -327,6 +331,12 @@ def train(
                     per_env_dones[e].append(float(done or trunc))
                     per_env_masks[e].append(mask.copy())
 
+                    # Penalise cycle termination: neither player won, game not truncated.
+                    if (done and not trunc
+                            and raw_r < 10.0
+                            and next_info.get("rewards", {}).get("blue", 0.0) < 10.0):
+                        per_env_rewards[e][-1] -= CYCLE_TERMINAL_PENALTY / REWARD_SCALE
+
                     obs_buf[e] = next_obs
                     info_buf[e] = next_info
 
@@ -354,6 +364,11 @@ def train(
                             red_final = next_info["rewards"].get("red", 0.0) / REWARD_SCALE
                             per_env_rewards[e][-1] += red_final
                             per_env_dones[e][-1] = 1.0
+                            # Penalise cycle termination triggered by opponent's move.
+                            if (done and not trunc
+                                    and next_info["rewards"].get("red", 0.0) < 10.0
+                                    and next_info["rewards"].get("blue", 0.0) < 10.0):
+                                per_env_rewards[e][-1] -= CYCLE_TERMINAL_PENALTY / REWARD_SCALE
                         _on_episode_end(
                             e, env, envs, obs_buf, info_buf,
                             opponents, is_selfplay, pool, net,

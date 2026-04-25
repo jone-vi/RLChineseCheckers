@@ -162,8 +162,10 @@ class ChineseCheckersEnv(gymnasium.Env):
             # Non-winners keep default 0.0 — no loss penalty
             terminated = True
 
-        elif self._state_hash_counts[h] >= 20:
-            # Safety valve for extremely cyclic games; no explicit penalty
+        elif self._state_hash_counts[h] >= 10:
+            # Cycle termination: ~5 full back-and-forth cycles is sufficient evidence.
+            # Reduced from 20 to recover wasted experience sooner; combined with
+            # CYCLE_TERMINAL_PENALTY in ppo.py, this gives earlier negative signal.
             terminated = True
 
         elif all(self._move_counts[c] >= 200 for c in self._active_colours):
