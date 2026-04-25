@@ -11,9 +11,7 @@ Loads Stage 1 weights and refines via PPO with:
 - Checkpoints every 100K steps
 
 Exploration schedule per game:
-  moves  0-2 : uniform random (not stored in buffer)
-  moves  3-9 : temperature 1.5
-  moves 10+  : temperature 0.3
+  all moves   : temperature 0.3 (matches eval; prevents high-T early-move cycles)
 
 Usage:
     python -m src.training.ppo
@@ -45,7 +43,7 @@ ROLLOUT_STEPS = 128          # steps per env per update → ~1024 transitions
 GAMMA = 0.99
 GAE_LAMBDA = 0.95
 CLIP_EPS = 0.2
-ENT_COEF = 0.005
+ENT_COEF = 0.003
 VF_COEF = 0.5
 LR = 3e-4
 N_EPOCHS = 4                 # PPO update epochs per rollout batch
@@ -61,16 +59,9 @@ PROMOTE_RATE = 0.55
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _get_temperature(move_count: int):
-    """
-    Returns temperature for the exploration schedule, or None for random action.
-    Random actions (move_count < 3) are NOT stored in the rollout buffer.
-    """
-    if move_count < 3:
-        return None    # uniform random; skip buffer
-    if move_count < 10:
-        return 1.5     # exploratory
-    return 0.3         # exploitation
+def _get_temperature(move_count: int) -> float:
+    """Fixed temperature matching eval behavior — prevents high-T early moves from causing cycles."""
+    return 0.3
 
 
 def _compute_gae(
@@ -202,7 +193,7 @@ def train(
 
     for e in range(N_ENVS):
         obs_buf[e], info_buf[e] = envs[e].reset()
-        mix = 0.5 if global_step < 500_000 else 0.3
+        mix = 1.0 if global_step < 500_000 else 0.3
         opp = pool.sample_opponent(net, mix_ratio=mix)
         opponents[e] = opp
         is_selfplay[e] = (opp is net)
@@ -260,25 +251,6 @@ def train(
                 if is_learning:
                     move_count = env._move_counts[colour]
                     temp = _get_temperature(move_count)
-
-                    if temp is None:
-                        # Random action — take it but don't store in buffer
-                        legal = np.where(mask)[0]
-                        action = int(np.random.choice(legal))
-                        next_obs, raw_r, done, trunc, next_info = env.step(action)
-                        global_step += 1
-                        ep_rew_accum[e] += raw_r / REWARD_SCALE
-                        obs_buf[e] = next_obs
-                        info_buf[e] = next_info
-                        if done or trunc:
-                            _on_episode_end(
-                                e, env, envs, obs_buf, info_buf,
-                                opponents, is_selfplay, pool, net,
-                                ep_wins, ep_rewards, ep_rew_accum, ep_term_types,
-                                next_info, done, trunc,
-                                global_step=global_step,
-                            )
-                        continue
 
                     # Compute action + log_prob + value under learning net
                     obs_t = torch.from_numpy(obs).float().unsqueeze(0).to(dev)
