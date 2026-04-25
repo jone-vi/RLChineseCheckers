@@ -501,17 +501,16 @@ def train(
 
                 entropy_loss = ent.mean()
 
-                # Entropy ceiling early stop: KL check misses rising entropy when
-                # advantages are positive (sampled actions reinforced → approx_kl ≤ 0).
-                # Direct check prevents gradual rise across the full minibatch loop.
-                if not in_warmup and entropy_loss.item() > MAX_ENT:
-                    kl_exceeded = True
-                    break
-
                 # Entropy regularization: small bonus below MAX_ENT, strong penalty above.
                 # Keeps the policy diverse enough to explore but not so random it loses signal.
                 ent_reg = (-ENT_COEF * entropy_loss
                            + ENT_PENALTY_COEF * torch.clamp(entropy_loss - MAX_ENT, min=0.0))
+
+                # Recovery mode: when entropy exceeds ceiling, skip the policy gradient
+                # (which would amplify it further) and apply only entropy penalty + value.
+                # Avoids the deadlock of break-before-update: penalty actively drives
+                # entropy back below MAX_ENT rather than halting all learning.
+                in_ent_recovery = (not in_warmup) and (entropy_loss.item() > MAX_ENT)
 
                 # During warmup: only update value head so it can calibrate on real game dynamics.
                 # Policy gradient is frozen — Stage 1 value head was trained on heuristic games and
@@ -519,6 +518,9 @@ def train(
                 # corrupt the policy in the very first rollout if left unchecked.
                 if in_warmup:
                     loss = VF_COEF * value_loss
+                elif in_ent_recovery:
+                    loss = (ENT_PENALTY_COEF * torch.clamp(entropy_loss - MAX_ENT, min=0.0)
+                            + VF_COEF * value_loss)
                 else:
                     loss = policy_loss + VF_COEF * value_loss + ent_reg
 
@@ -532,12 +534,14 @@ def train(
                 sum_ent += entropy_loss.item()
                 n_updates += 1
 
-                # KL early stopping: approximate KL = mean(log π_old - log π_new)
-                with torch.no_grad():
-                    approx_kl = (logprobs_batch[idx] - new_lp).mean().item()
-                if approx_kl > TARGET_KL:
-                    kl_exceeded = True
-                    break
+                # KL early stopping: skip during entropy recovery (need all minibatches
+                # to run their penalty updates to bring entropy back below MAX_ENT).
+                if not in_ent_recovery:
+                    with torch.no_grad():
+                        approx_kl = (logprobs_batch[idx] - new_lp).mean().item()
+                    if approx_kl > TARGET_KL:
+                        kl_exceeded = True
+                        break
 
         # Extra value-head calibration epochs: encoder and policy head frozen so these
         # updates only move the value head.  This keeps v_loss low even as the policy
