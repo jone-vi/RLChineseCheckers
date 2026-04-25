@@ -64,12 +64,13 @@ ENT_COEF = 0.0               # Stage 1 already has sufficient diversity (ent≈0
                              # a supervised prior — the policy should refine, not explore.
 ENT_PENALTY_COEF = 5.0       # at entropy=0.6 (above ceiling 0.5): penalty=5.0×0.1=0.5, which is 5-10×
                              # the typical policy_loss of 0.05-0.1 — strongly enforces the ceiling.
-                             # 2.0 was insufficient: entropy climbed gradually over 16 minibatches while
-                             # the per-minibatch penalty was too weak to reverse the trend.
-MAX_ENT = 0.5                # ceiling at 0.5: empirically the policy is healthy in [0.1, 0.4] (win=91%
-                             # at ent=0.17); 0.5 gives headroom while catching explosive rise early.
-                             # was 0.7 — entropy rose from 0.17→0.84 (avg) across 16 minibatches while
-                             # KL check never fired (advantages positive → approx_kl ≤ 0).
+MAX_ENT = 0.5                # hard ceiling; above this, recovery mode skips policy gradient entirely.
+ENT_FLOOR = 0.15             # minimum entropy; prevents the policy from becoming so concentrated
+                             # (ent→0.077 at win=99%) that any PPO update causes a spike.
+                             # Stage 1 starts at ent≈0.13; floor at 0.15 keeps the policy just above
+                             # that baseline so it's never in the fragile near-deterministic regime.
+ENT_FLOOR_COEF = 2.0         # at ent=0.077: floor penalty=2.0×0.073=0.15 ≈ 3× policy_loss — strong
+                             # enough to prevent near-zero entropy but not so large it kills learning.
 VF_COEF = 0.5
 LR = 1e-4                    # was 3e-4 — lower LR preserves Stage 1 knowledge during fine-tuning
 N_EPOCHS = 1                 # policy epochs per rollout — deliberately 1 to prevent large policy drift
@@ -509,10 +510,12 @@ def train(
 
                 entropy_loss = ent.mean()
 
-                # Entropy regularization: small bonus below MAX_ENT, strong penalty above.
-                # Keeps the policy diverse enough to explore but not so random it loses signal.
+                # Entropy band: penalty above MAX_ENT ceiling + penalty below ENT_FLOOR.
+                # Floor prevents the policy from becoming so concentrated (ent→0.077 at win=99%)
+                # that any PPO update causes a catastrophic spike.
                 ent_reg = (-ENT_COEF * entropy_loss
-                           + ENT_PENALTY_COEF * torch.clamp(entropy_loss - MAX_ENT, min=0.0))
+                           + ENT_PENALTY_COEF * torch.clamp(entropy_loss - MAX_ENT, min=0.0)
+                           + ENT_FLOOR_COEF  * torch.clamp(ENT_FLOOR - entropy_loss, min=0.0))
 
                 # Recovery mode: when entropy exceeds ceiling, skip the policy gradient
                 # (which would amplify it further) and apply only entropy penalty + value.
