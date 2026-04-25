@@ -45,7 +45,7 @@ GAMMA = 0.99
 GAE_LAMBDA = 0.95
 CLIP_EPS = 0.1               # fine-tuning from pretrained policy: 0.1, not 0.2
 CLIP_EPS_START = 0.01        # start even tighter; ramp to CLIP_EPS over POLICY_RAMPUP_ROLLOUTS
-POLICY_RAMPUP_ROLLOUTS = 20  # rollouts after value warmup before encoder is unfrozen and clip hits CLIP_EPS
+POLICY_RAMPUP_ROLLOUTS = 50  # rollouts after value warmup before encoder is unfrozen and clip hits CLIP_EPS
                              # Phase sequence:
                              #   warmup (WARMUP_ROLLOUTS): encoder+policy frozen, value head calibrates
                              #   rampup (POLICY_RAMPUP_ROLLOUTS): policy head unfrozen, encoder still frozen,
