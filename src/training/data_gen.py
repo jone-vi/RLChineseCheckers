@@ -251,8 +251,8 @@ def _parse():
     p.add_argument("--n-games",     type=int,   default=20_000)
     p.add_argument("--sample-rate", type=float, default=0.05)
     p.add_argument("--out",         type=str,   default="data/stage1.h5")
-    p.add_argument("--player-mix",  type=str,   default="2:0.8,4:0.1,6:0.1",
-                   help='Player count mix, e.g. "2:0.8,4:0.1,6:0.1"')
+    p.add_argument("--player-mix",  type=str,   default="2:0.4,3:0.15,4:0.15,5:0.15,6:0.1",
+                   help='Player count mix, e.g. "2:0.4,3:0.15,4:0.15,5:0.15,6:0.1"')
     p.add_argument("--seed",        type=int,   default=42)
     return p.parse_args()
 

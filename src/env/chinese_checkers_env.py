@@ -165,7 +165,7 @@ class ChineseCheckersEnv(gymnasium.Env):
                     rewards[c] = -10.0 / (N - 1)
             terminated = True
 
-        elif self._state_hash_counts[h] >= 3:
+        elif self._state_hash_counts[h] >= 5:
             for c in self._active_colours:
                 rewards[c] = -2.0
             terminated = True
@@ -353,7 +353,7 @@ class ChineseCheckersEnv(gymnasium.Env):
         #    configuration.  Per-player tracking fires even when the opponent moves
         #    forward (unlike full-board hash which only fires in pure self-play cycles).
         if pos_count > 1:
-            r -= 0.5
+            r -= 0.1
 
         return r
 

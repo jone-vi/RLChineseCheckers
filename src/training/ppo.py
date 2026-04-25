@@ -45,7 +45,7 @@ ROLLOUT_STEPS = 128          # steps per env per update → ~1024 transitions
 GAMMA = 0.99
 GAE_LAMBDA = 0.95
 CLIP_EPS = 0.2
-ENT_COEF = 0.01
+ENT_COEF = 0.005
 VF_COEF = 0.5
 LR = 3e-4
 N_EPOCHS = 4                 # PPO update epochs per rollout batch
@@ -191,6 +191,9 @@ def train(
     heuristic = HeuristicAgent(seed=42)
     pool = OpponentPool(heuristic_agent=heuristic, pool_size=5, ckpt_dir=ckpt_dir)
 
+    # -- Tracking (global_step needed before env init for mix_ratio) --
+    global_step = resume_step
+
     # -- Per-env state --
     obs_buf = [None] * N_ENVS      # current observation after last step
     info_buf = [None] * N_ENVS     # current info after last step
@@ -199,7 +202,8 @@ def train(
 
     for e in range(N_ENVS):
         obs_buf[e], info_buf[e] = envs[e].reset()
-        opp = pool.sample_opponent(net, mix_ratio=0.3)
+        mix = 0.5 if global_step < 500_000 else 0.3
+        opp = pool.sample_opponent(net, mix_ratio=mix)
         opponents[e] = opp
         is_selfplay[e] = (opp is net)
 
@@ -215,7 +219,6 @@ def train(
     # -- Tracking --
     ckpt_save_dir = _ROOT / ckpt_dir
     ckpt_save_dir.mkdir(parents=True, exist_ok=True)
-    global_step = resume_step
     rollout_count = 0
     last_ckpt_step = resume_step
     last_eval_step = resume_step
@@ -273,6 +276,7 @@ def train(
                                 opponents, is_selfplay, pool, net,
                                 ep_wins, ep_rewards, ep_rew_accum, ep_term_types,
                                 next_info, done, trunc,
+                                global_step=global_step,
                             )
                         continue
 
@@ -325,6 +329,7 @@ def train(
                             opponents, is_selfplay, pool, net,
                             ep_wins, ep_rewards, ep_rew_accum, ep_term_types,
                             next_info, done, trunc,
+                            global_step=global_step,
                         )
 
                 else:
@@ -340,6 +345,7 @@ def train(
                             opponents, is_selfplay, pool, net,
                             ep_wins, ep_rewards, ep_rew_accum, ep_term_types,
                             next_info, done, trunc,
+                            global_step=global_step,
                         )
 
         # ----------------------------------------------------------------
@@ -516,6 +522,7 @@ def _on_episode_end(
     info: dict,
     terminated: bool,
     truncated: bool,
+    global_step: int = 0,
 ) -> None:
     """Reset env, sample new opponent, record win/reward statistics."""
     rewards = info.get("rewards", {})
@@ -537,7 +544,8 @@ def _on_episode_end(
     ep_term_types.append(term_type)
 
     obs_buf[e], info_buf[e] = envs[e].reset()
-    opp = pool.sample_opponent(net, mix_ratio=0.3)
+    mix = 0.5 if global_step < 500_000 else 0.3
+    opp = pool.sample_opponent(net, mix_ratio=mix)
     opponents[e] = opp
     is_selfplay[e] = (opp is net)
 
