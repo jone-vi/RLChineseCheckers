@@ -45,7 +45,7 @@ GAMMA = 0.99
 GAE_LAMBDA = 0.95
 CLIP_EPS = 0.1               # fine-tuning from pretrained policy: 0.1, not 0.2
 CLIP_EPS_START = 0.01        # start even tighter; ramp to CLIP_EPS over POLICY_RAMPUP_ROLLOUTS
-POLICY_RAMPUP_ROLLOUTS = 100  # rollouts after value warmup before encoder is unfrozen and clip hits CLIP_EPS
+POLICY_RAMPUP_ROLLOUTS = 400  # rollouts after value warmup before encoder is unfrozen and clip hits CLIP_EPS
                              # Phase sequence:
                              #   warmup (WARMUP_ROLLOUTS): encoder+policy frozen, value head calibrates
                              #   rampup (POLICY_RAMPUP_ROLLOUTS): policy head unfrozen, encoder still frozen,
@@ -62,7 +62,7 @@ N_EPOCHS = 1                 # 4 epochs × 16 minibatches = 64 steps per rollout
 MINIBATCH = 64
 TARGET_KL = 0.01             # stop epoch early if policy changes too much
 POOL_MIX_RATIO = 1.0         # all games vs pool (Stage 1 + heuristic + promoted checkpoints); no self-play
-WARMUP_ROLLOUTS = 100         # ~50K steps: freeze policy, let value head calibrate on real game dynamics
+WARMUP_ROLLOUTS = 200         # ~50K steps: freeze policy, let value head calibrate on real game dynamics
                              # before policy updates begin (Stage 1 value head trained on heuristic games,
                              # not Stage 1 self-play — mispredictions create huge noisy advantages otherwise)
 MAX_STEPS = 5_000_000
