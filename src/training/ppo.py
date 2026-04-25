@@ -45,6 +45,8 @@ GAMMA = 0.99
 GAE_LAMBDA = 0.95
 CLIP_EPS = 0.2
 ENT_COEF = 0.0001            # was 0.003 — high entropy coef spread the policy faster than PPO could improve it
+ENT_PENALTY_COEF = 0.01      # penalty for entropy exceeding MAX_ENT; 100× stronger than the bonus
+MAX_ENT = 2.0                # entropy ceiling — above this the policy is too diffuse to win reliably
 VF_COEF = 0.5
 LR = 1e-4                    # was 3e-4 — lower LR preserves Stage 1 knowledge during fine-tuning
 N_EPOCHS = 4                 # was 1 — offset the lower LR with more gradient steps per rollout
@@ -428,7 +430,11 @@ def train(
 
                 entropy_loss = ent.mean()
 
-                loss = policy_loss + VF_COEF * value_loss - ENT_COEF * entropy_loss
+                # Entropy regularization: small bonus below MAX_ENT, strong penalty above.
+                # Keeps the policy diverse enough to explore but not so random it loses signal.
+                ent_reg = (-ENT_COEF * entropy_loss
+                           + ENT_PENALTY_COEF * torch.clamp(entropy_loss - MAX_ENT, min=0.0))
+                loss = policy_loss + VF_COEF * value_loss + ent_reg
 
                 optimiser.zero_grad()
                 loss.backward()
