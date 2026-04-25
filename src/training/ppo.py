@@ -56,14 +56,14 @@ POLICY_RAMPUP_ROLLOUTS = 200  # rollouts after value warmup before encoder is un
                              # At rollout 38 (clip=0.080) win rate collapsed; 200 rollouts keeps clip<0.027
                              # at the same point in training.
 ENT_COEF = 0.0001            # was 0.003 — high entropy coef spread the policy faster than PPO could improve it
-ENT_PENALTY_COEF = 2.0       # at entropy=0.8 (above ceiling 0.7): penalty=2.0×0.1=0.2, which is 2-4× the
-                             # typical policy_loss of 0.05-0.1 — this actually enforces the ceiling.
-                             # 0.05 was too weak: at entropy=2.5, penalty=0.025 vs policy_loss=0.1 → ignored.
-MAX_ENT = 0.7                # ceiling set just above observed collapse threshold: win rate dropped at
-                             # entropy=0.66 with MAX_ENT=1.2 — the penalty never fired (1.2>0.66, penalty=0).
-                             # 0.7 ensures penalty activates before the policy degrades.
-                             # was 1.2 — empirically the good zone is 0.3-0.7 during rampup; 1.2 was above
-                             # the failure threshold so gave zero protection.
+ENT_PENALTY_COEF = 5.0       # at entropy=0.6 (above ceiling 0.5): penalty=5.0×0.1=0.5, which is 5-10×
+                             # the typical policy_loss of 0.05-0.1 — strongly enforces the ceiling.
+                             # 2.0 was insufficient: entropy climbed gradually over 16 minibatches while
+                             # the per-minibatch penalty was too weak to reverse the trend.
+MAX_ENT = 0.5                # ceiling at 0.5: empirically the policy is healthy in [0.1, 0.4] (win=91%
+                             # at ent=0.17); 0.5 gives headroom while catching explosive rise early.
+                             # was 0.7 — entropy rose from 0.17→0.84 (avg) across 16 minibatches while
+                             # KL check never fired (advantages positive → approx_kl ≤ 0).
 VF_COEF = 0.5
 LR = 1e-4                    # was 3e-4 — lower LR preserves Stage 1 knowledge during fine-tuning
 N_EPOCHS = 1                 # policy epochs per rollout — deliberately 1 to prevent large policy drift
@@ -500,6 +500,13 @@ def train(
                 )
 
                 entropy_loss = ent.mean()
+
+                # Entropy ceiling early stop: KL check misses rising entropy when
+                # advantages are positive (sampled actions reinforced → approx_kl ≤ 0).
+                # Direct check prevents gradual rise across the full minibatch loop.
+                if not in_warmup and entropy_loss.item() > MAX_ENT:
+                    kl_exceeded = True
+                    break
 
                 # Entropy regularization: small bonus below MAX_ENT, strong penalty above.
                 # Keeps the policy diverse enough to explore but not so random it loses signal.
