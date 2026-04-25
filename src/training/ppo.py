@@ -43,13 +43,15 @@ N_ENVS = 8
 ROLLOUT_STEPS = 128          # steps per env per update → ~1024 transitions
 GAMMA = 0.99
 GAE_LAMBDA = 0.95
-CLIP_EPS = 0.2
-CLIP_EPS_START = 0.02        # initial clip eps right after value warmup; ramped up to CLIP_EPS
-                             # over POLICY_RAMPUP_ROLLOUTS to prevent the concentrated Stage 1 policy
-                             # (entropy ~0.12, top-action prob ~0.99) from being shredded in the first
-                             # PPO update — ε=0.2 allows prob drop from 0.99→0.79 in one step, spiking
-                             # entropy to ~2.0 and collapsing win rate immediately
-POLICY_RAMPUP_ROLLOUTS = 20  # ramp clip eps from CLIP_EPS_START → CLIP_EPS over this many rollouts
+CLIP_EPS = 0.1               # fine-tuning from pretrained policy: 0.1, not 0.2
+CLIP_EPS_START = 0.01        # start even tighter; ramp to CLIP_EPS over POLICY_RAMPUP_ROLLOUTS
+POLICY_RAMPUP_ROLLOUTS = 20  # rollouts after value warmup before encoder is unfrozen and clip hits CLIP_EPS
+                             # Phase sequence:
+                             #   warmup (WARMUP_ROLLOUTS): encoder+policy frozen, value head calibrates
+                             #   rampup (POLICY_RAMPUP_ROLLOUTS): policy head unfrozen, encoder still frozen,
+                             #     clip ramps 0.01→0.1  — prevents encoder-coupling drift (encoder changes
+                             #     shift policy head outputs even without policy gradient, bypassing clip+KL)
+                             #   full training: everything unfrozen, clip=0.1
 ENT_COEF = 0.0001            # was 0.003 — high entropy coef spread the policy faster than PPO could improve it
 ENT_PENALTY_COEF = 0.05      # penalty for entropy exceeding MAX_ENT (raised from 0.01 — was too weak)
 MAX_ENT = 2.0                # entropy ceiling — above this the policy is too diffuse to win reliably
@@ -428,12 +430,16 @@ def train(
         else:
             clip_eps = CLIP_EPS
 
-        # Freeze encoder+policy head during warmup so encoder gradient from value_loss
-        # cannot corrupt the policy.  Zeroing policy_loss alone is not enough: the shared
-        # encoder still receives value gradient, its weights drift, and policy head outputs
-        # change even though policy head weights don't.  requires_grad_(False) stops all
-        # gradient accumulation for those parameters while allowing forward passes.
-        net.encoder.requires_grad_(not in_warmup)
+        # Encoder freeze spans warmup AND rampup phases:
+        #   warmup: value head calibrates; encoder frozen so its features don't drift under the policy head
+        #   rampup: policy head adapts on fixed encoder representations; encoder still frozen so
+        #     value-loss gradient can't shift encoder features and implicitly re-shape the policy
+        #     distribution (this bypasses clip+KL and was the root cause of entropy explosion)
+        # Policy head is unfrozen as soon as warmup ends so it can start learning new strategies.
+        in_encoder_freeze = rollout_count <= WARMUP_ROLLOUTS + POLICY_RAMPUP_ROLLOUTS
+        if rollout_count == WARMUP_ROLLOUTS + POLICY_RAMPUP_ROLLOUTS + 1:
+            print(f"[Rampup] Encoder unfrozen at step {global_step:,} — full training begins")
+        net.encoder.requires_grad_(not in_encoder_freeze)
         net.policy_head.requires_grad_(not in_warmup)
 
         for _ in range(N_EPOCHS):
@@ -517,7 +523,12 @@ def train(
             p_loss_avg = sum_p_loss / max(n_updates, 1)
             v_loss_avg = sum_v_loss / max(n_updates, 1)
             ent_avg = sum_ent / max(n_updates, 1)
-            clip_tag = f" | clip={clip_eps:.3f}" if rollouts_since_policy < POLICY_RAMPUP_ROLLOUTS else ""
+            if in_warmup:
+                clip_tag = " | [warmup]"
+            elif in_encoder_freeze:
+                clip_tag = f" | clip={clip_eps:.3f}[enc-frz]"
+            else:
+                clip_tag = ""
             print(
                 f"step={global_step:>9,}"
                 f" | win={recent_win:.3f}"
