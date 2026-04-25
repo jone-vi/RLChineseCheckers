@@ -44,18 +44,24 @@ ROLLOUT_STEPS = 128          # steps per env per update → ~1024 transitions
 GAMMA = 0.99
 GAE_LAMBDA = 0.95
 CLIP_EPS = 0.1               # fine-tuning from pretrained policy: 0.1, not 0.2
-CLIP_EPS_START = 0.01        # start even tighter; ramp to CLIP_EPS over POLICY_RAMPUP_ROLLOUTS
-POLICY_RAMPUP_ROLLOUTS = 200  # rollouts after value warmup before encoder is unfrozen and clip hits CLIP_EPS
+CLIP_EPS_START = 0.003       # very tight start: Stage 1 policy is near-deterministic (ent≈0.13),
+                             # and Adam's first step on the policy head is ≈±LR per parameter
+                             # (no prior statistics → sign-normalised step), which is large enough
+                             # to cause a catastrophic entropy jump (0.13→1.0) at clip=0.01.
+                             # 0.003 limits per-step ratio change to 0.3%, preventing the first-
+                             # minibatch explosion. Ramps to 0.1 over POLICY_RAMPUP_ROLLOUTS.
+POLICY_RAMPUP_ROLLOUTS = 400  # rollouts after value warmup before encoder is unfrozen and clip hits CLIP_EPS
                              # Phase sequence:
                              #   warmup (WARMUP_ROLLOUTS): encoder+policy frozen, value head calibrates
                              #   rampup (POLICY_RAMPUP_ROLLOUTS): policy head unfrozen, encoder still frozen,
-                             #     clip ramps 0.01→0.1  — prevents encoder-coupling drift (encoder changes
+                             #     clip ramps 0.003→0.1  — prevents encoder-coupling drift (encoder changes
                              #     shift policy head outputs even without policy gradient, bypassing clip+KL)
                              #   full training: everything unfrozen, clip=0.1
-                             # Previously 50 rollouts = 8× faster ramp than the run that reached win=93%.
-                             # At rollout 38 (clip=0.080) win rate collapsed; 200 rollouts keeps clip<0.027
-                             # at the same point in training.
-ENT_COEF = 0.0001            # was 0.003 — high entropy coef spread the policy faster than PPO could improve it
+                             # 400 (doubled from 200) so the very tight CLIP_EPS_START=0.003 has enough
+                             # rollouts to ramp to a useful clip value while staying conservative early.
+ENT_COEF = 0.0               # Stage 1 already has sufficient diversity (ent≈0.13); no bonus needed.
+                             # Any push toward exploration is pure instability when fine-tuning from
+                             # a supervised prior — the policy should refine, not explore.
 ENT_PENALTY_COEF = 5.0       # at entropy=0.6 (above ceiling 0.5): penalty=5.0×0.1=0.5, which is 5-10×
                              # the typical policy_loss of 0.05-0.1 — strongly enforces the ceiling.
                              # 2.0 was insufficient: entropy climbed gradually over 16 minibatches while
@@ -74,10 +80,12 @@ N_VALUE_EXTRA = 3            # additional value-head-only epochs per rollout (en
 MINIBATCH = 64
 TARGET_KL = 0.01             # stop epoch early if policy changes too much
 POOL_MIX_RATIO = 1.0         # all games vs pool (Stage 1 + heuristic + promoted checkpoints); no self-play
-WARMUP_ROLLOUTS = 100         # ~100K steps: freeze policy, let value head calibrate on real game dynamics
-                             # before policy updates begin (Stage 1 value head trained on heuristic games,
-                             # not Stage 1 self-play — mispredictions create huge noisy advantages otherwise)
-                             # was 50 — value head needs more time to reach v_loss<0.03 stably
+WARMUP_ROLLOUTS = 200         # ~200K steps: freeze policy, let value head calibrate on real game dynamics
+                             # before policy updates begin.  200 (doubled from 100) because:
+                             # (a) the first pool update at step ~100K changes opponent dynamics, causing
+                             #     v_loss to spike — the head needs time to recalibrate on the new games
+                             # (b) at 100 rollouts, v_loss was still 0.10+ when policy updates started,
+                             #     producing noisy advantages that drove the entropy explosion
 CYCLE_TERMINAL_PENALTY = 1.0  # raw units; /REWARD_SCALE = -0.10 scaled.
                                # Cycles previously matched loss reward (+0.01-0.03), giving the
                                # agent no incentive to avoid them against strong pool opponents.
