@@ -86,7 +86,7 @@ N_VALUE_EXTRA = 3            # additional value-head-only epochs per rollout (en
                              # v_loss oscillated 0.07-0.17 throughout rampup because the policy changes every
                              # rollout and 1 epoch of value updates can't track it; extra epochs hold it low,
                              # producing accurate advantages and preventing the noisy-grad→entropy-drift loop.
-MINIBATCH = 128              # increased from 64; larger batches dilute rare high-negative-advantage
+MINIBATCH = 64              # increased from 64; larger batches dilute rare high-negative-advantage
                              # loss samples (2% of episodes), reducing per-step gradient variance
                              # and halving update frequency per rollout (~4 vs ~8 with 64).
                              # Stays well below B≈512 so each rollout still gets meaningful updates.
