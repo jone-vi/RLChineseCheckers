@@ -52,7 +52,7 @@ CLIP_EPS_START = 0.003       # very tight start: Stage 1 policy is near-determin
                              # to cause a catastrophic entropy jump (0.13→1.0) at clip=0.01.
                              # 0.003 limits per-step ratio change to 0.3%, preventing the first-
                              # minibatch explosion. Ramps to 0.1 over POLICY_RAMPUP_ROLLOUTS.
-POLICY_RAMPUP_ROLLOUTS = 400  # rollouts after value warmup before encoder is unfrozen and clip hits CLIP_EPS
+POLICY_RAMPUP_ROLLOUTS = 50  # rollouts after value warmup before encoder is unfrozen and clip hits CLIP_EPS
                              # Phase sequence:
                              #   warmup (WARMUP_ROLLOUTS): encoder+policy frozen, value head calibrates
                              #   rampup (POLICY_RAMPUP_ROLLOUTS): policy head unfrozen, encoder still frozen,
@@ -64,13 +64,16 @@ POLICY_RAMPUP_ROLLOUTS = 400  # rollouts after value warmup before encoder is un
 ENT_COEF = 0.0               # Stage 1 already has sufficient diversity (ent≈0.13); no bonus needed.
                              # Any push toward exploration is pure instability when fine-tuning from
                              # a supervised prior — the policy should refine, not explore.
-ENT_PENALTY_COEF = 5.0       # at entropy=0.4 (above ceiling 0.35): penalty=5.0×0.05=0.25, which is
+ENT_PENALTY_COEF = 5.0       # at entropy=0.7 (above ceiling 0.60): penalty=5.0×0.10=0.50, which is
                              # 3-5× the typical policy_loss of 0.05-0.1 — strongly enforces the ceiling.
-MAX_ENT = 0.35               # hard ceiling (lowered from 0.5); above this, recovery mode skips policy
-                             # gradient entirely.  0.5 was too permissive — the spike reached 0.686
-                             # before recovery fired because the 10-rollout log average lagged the
-                             # actual per-minibatch entropy.  0.35 catches spikes in the same rollout
-                             # they begin, before the policy is substantially corrupted.
+MAX_ENT = 0.60               # hard ceiling; above this, recovery mode skips policy gradient entirely.
+                             # Raised from 0.35 to 0.60: the actual Stage 1 policy has ent≈1.77
+                             # (not the ent≈0.13 assumed in early comments). With MAX_ENT=0.35,
+                             # the first rollout after warmup has ent=0.62 > 0.35, firing recovery
+                             # on 11/16 minibatches and concentrating the policy on Stage 1's cyclic
+                             # high-probability actions before policy gradient can improve things.
+                             # At 0.60, recovery barely fires in rollout 1, then stops — leaving
+                             # policy gradient free to reinforce wins from rollout 2 onward.
 ENT_FLOOR = 0.22             # minimum entropy (raised from 0.15); prevents the near-deterministic
                              # regime (ent≈0.13) where the masking nonlinearity is unstable.  The
                              # masking maps 1210 raw logits to ~50 valid actions; a tiny logit shift
@@ -93,12 +96,17 @@ MINIBATCH = 64              # increased from 64; larger batches dilute rare high
                              # and halving update frequency per rollout (~4 vs ~8 with 64).
                              # Stays well below B≈512 so each rollout still gets meaningful updates.
 TARGET_KL = 0.01             # stop epoch early if policy changes too much
-SELFPLAY_GAME_RATIO = 0.50   # whole-game live self-play.  All seats use the current net,
+SELFPLAY_GAME_RATIO = 0.30   # whole-game live self-play.  All seats use the current net,
                              # and all seats' trajectories train the shared policy.
+                             # Reduced from 0.50: in N-player self-play all N seats generate
+                             # transitions, so 50% self-play by game count → ~86% of batch
+                             # transitions come from self-play.  If the policy cycles, 86% of
+                             # training data is cyclic.  At 0.30 it's ~72%, and pool/heuristic
+                             # games (which never cycle) form a 28% stable baseline signal.
 MAX_FROZEN_NET_OPPONENTS = 1 # in pool games, cap stochastic frozen nets per game.
                              # The remaining seats use the heuristic, avoiding the
                              # multiplayer compounding of draw-prone checkpoint policies.
-WARMUP_ROLLOUTS = 200         # ~200K steps: freeze policy, let value head calibrate on real game dynamics
+WARMUP_ROLLOUTS = 50         # ~200K steps: freeze policy, let value head calibrate on real game dynamics
                              # before policy updates begin.  200 (doubled from 100) because:
                              # (a) the first pool update at step ~100K changes opponent dynamics, causing
                              #     v_loss to spike — the head needs time to recalibrate on the new games
@@ -654,6 +662,29 @@ def train(
                     last_value = _bootstrap_value_for_colour(net, env, colour, dev)
 
                 adv, ret = _compute_gae(rewards_e, values_e, dones_e, last_value)
+
+                # Per-episode advantage normalisation: equalises gradient magnitude
+                # across episodes regardless of return scale. Without this, win-heavy
+                # batches produce extreme negative advantages for cycle episodes (up to
+                # −5.0 after batch normalisation, 35× larger than win-game advantages),
+                # causing "avoid everything" gradients that cascade into more cycling.
+                # In multi-player, also prevents N-player self-play episodes (which
+                # contribute N colour trajectories) from dominating 2-player episodes.
+                ep_start = 0
+                for t in range(len(adv)):
+                    if dones_e[t] == 1.0:
+                        ep_adv = adv[ep_start : t + 1]
+                        if len(ep_adv) > 1:
+                            ep_std = float(ep_adv.std())
+                            if ep_std > 1e-8:
+                                adv[ep_start : t + 1] = (ep_adv - float(ep_adv.mean())) / ep_std
+                        ep_start = t + 1
+                if ep_start < len(adv):          # incomplete episode at rollout boundary
+                    ep_adv = adv[ep_start:]
+                    if len(ep_adv) > 1:
+                        ep_std = float(ep_adv.std())
+                        if ep_std > 1e-8:
+                            adv[ep_start:] = (ep_adv - float(ep_adv.mean())) / ep_std
 
                 all_obs.extend(buffers["obs"])
                 all_actions.extend(buffers["actions"])
