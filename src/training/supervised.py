@@ -42,7 +42,7 @@ class Stage1Dataset(Dataset):
 
     HDF5 schema (written by data_gen.py):
         obs      float32 [N, 1089]  — board observation (acting player's POV)
-        actions  int16   [N]        — encoded action (pin_id * 121 + dest_idx)
+        actions  int16   [N]        — encoded action (pin_id * 121 + canonical_dest_idx)
         outcomes float32 [N]        — game outcome for acting player in [-1, 1]
 
     IMPORTANT: actions are stored as int16 but CrossEntropyLoss requires int64.
@@ -97,6 +97,13 @@ def train(
         )
 
     dataset = Stage1Dataset(str(h5_path))
+    with h5py.File(h5_path, "r") as f:
+        action_encoding = f.attrs.get("action_encoding", "legacy_absolute_destination")
+    if action_encoding != "canonical_destination_v2":
+        raise ValueError(
+            f"Dataset action_encoding={action_encoding!r}; "
+            "regenerate data with the current env for canonical-action training."
+        )
     # num_workers=0 avoids multiprocessing issues on macOS/Windows
     loader = DataLoader(
         dataset,
@@ -183,6 +190,7 @@ def train(
                         "weight_decay": weight_decay,
                         "n_epochs": n_epochs,
                     },
+                    "action_encoding": "canonical_destination_v2",
                 },
                 ckpt_path,
             )

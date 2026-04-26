@@ -44,6 +44,18 @@ COLOUR_OPPOSITES = {
     'purple':     'yellow',
 }
 
+# Number of 60-degree counter-clockwise rotations needed to put each player's
+# home corner in red's canonical home corner.  Action destinations and
+# observation cell indices are expressed in this canonical frame.
+CANONICAL_ROTATIONS = {
+    'red':        0,
+    'blue':       3,
+    'lawn green': 2,
+    'gray0':      5,
+    'yellow':     4,
+    'purple':     1,
+}
+
 
 class ChineseCheckersEnv(gymnasium.Env):
     """
@@ -52,7 +64,7 @@ class ChineseCheckersEnv(gymnasium.Env):
     Observation: 9-channel × 121-cell board, always from the current player's
     perspective (canonical channel rotation), flattened to shape (1089,).
 
-    Action: Discrete(1210) = pin_id * 121 + destination_index.
+    Action: Discrete(1210) = pin_id * 121 + canonical_destination_index.
     A binary action mask is returned in info["action_mask"].
 
     Multi-player: a single env instance manages all N players on one board.
@@ -84,6 +96,9 @@ class ChineseCheckersEnv(gymnasium.Env):
         self._active_colours: List[str] = self._select_colours()
         self._goal_zone_indices: Dict[str, Set[int]] = {}
         self._goal_targets: Dict[str, Tuple[float, float]] = {}
+        self._actual_to_canon: Dict[str, np.ndarray] = {}
+        self._canon_to_actual: Dict[str, np.ndarray] = {}
+        self._canonical_distance_field: Optional[np.ndarray] = None
         self._precompute_geometry()
 
         # Episode state — all re-initialised in reset()
@@ -139,7 +154,7 @@ class ChineseCheckersEnv(gymnasium.Env):
     def step(self, action: int):
         acting   = self._active_colours[self._turn_idx]
         pin_id   = action // self.N_CELLS
-        dest_idx = action %  self.N_CELLS
+        dest_idx = self.decode_action(action, acting)[1]
 
         d_before = self._prev_dist_sq[acting]
 
@@ -166,10 +181,10 @@ class ChineseCheckersEnv(gymnasium.Env):
             # Non-winners keep default 0.0 — no loss penalty
             terminated = True
 
-        elif self._state_hash_counts[h] >= 5:
-            # Cycle termination: 5 repetitions (~2-3 full back-and-forth cycles).
-            # Reduced from 10: shorter cycles mean fewer steps before terminal, so
-            # GAE discount (γ^T) decays less and credit assignment is more accurate.
+        elif self._state_hash_counts[h] >= (5 if self.n_players == 2 else 12):
+            # Full-board cycle termination is a safety valve.  Keep 2p fairly
+            # responsive, but be more patient in multiplayer because repeats can
+            # be caused by frozen opponents and are harder to credit locally.
             terminated = True
 
         elif all(self._move_counts[c] >= 200 for c in self._active_colours):
@@ -250,16 +265,67 @@ class ChineseCheckersEnv(gymnasium.Env):
             dc = tmp.cells[deepest_idx]
             self._goal_targets[colour] = (float(dc.q), float(dc.r))
 
+        for colour in COLOUR_ORDER:
+            a2c = np.empty(self.N_CELLS, dtype=np.int16)
+            c2a = np.empty(self.N_CELLS, dtype=np.int16)
+            turns = CANONICAL_ROTATIONS[colour]
+            for actual_idx, cell in enumerate(tmp.cells):
+                cq, cr = self._rotate_axial(cell.q, cell.r, turns)
+                canon_idx = tmp.index_of[(cq, cr)]
+                a2c[actual_idx] = canon_idx
+                c2a[canon_idx] = actual_idx
+            self._actual_to_canon[colour] = a2c
+            self._canon_to_actual[colour] = c2a
+
+        # In the canonical frame every player starts in red's home corner and
+        # aims at blue's corner, so the distance field is shared by all players.
+        goal_q, goal_r = self._goal_targets['red']
+        raw = np.array(
+            [self._axial_dist_sq_for_cells(tmp.cells, i, goal_q, goal_r)
+             for i in range(self.N_CELLS)],
+            dtype=np.float32,
+        )
+        max_d = raw.max()
+        self._canonical_distance_field = raw / max_d if max_d > 0 else raw
+
     def _init_board(self):
         """Create a fresh board and spawn all active players' pins at home positions."""
         self._board = HexBoard()
         self._pins  = {}
         for colour in self._active_colours:
-            idxs = self._board.axial_of_colour(colour)[:10]   # (r,q)-sorted order
+            # Pin ids are assigned in canonical home-corner order so the same
+            # action id refers to the same logical starting slot for every color.
+            idxs = sorted(
+                self._board.axial_of_colour(colour)[:10],
+                key=lambda i: int(self._actual_to_canon[colour][i]),
+            )
             self._pins[colour] = [
                 Pin(self._board, idxs[i], id=i, color=colour)
                 for i in range(10)
             ]
+
+    @staticmethod
+    def _rotate_axial(q: int, r: int, turns: int) -> Tuple[int, int]:
+        """Rotate axial coordinates counter-clockwise by turns * 60 degrees."""
+        for _ in range(turns % 6):
+            q, r = -r, q + r
+        return q, r
+
+    def encode_action(self, pin_id: int, actual_dest_idx: int, colour: str | None = None) -> int:
+        """Encode a real board destination into the current player's canonical action id."""
+        if colour is None:
+            colour = self._active_colours[self._turn_idx]
+        canon_dest = int(self._actual_to_canon[colour][actual_dest_idx])
+        return pin_id * self.N_CELLS + canon_dest
+
+    def decode_action(self, action: int, colour: str | None = None) -> Tuple[int, int]:
+        """Decode a canonical action id into (pin_id, real board destination index)."""
+        if colour is None:
+            colour = self._active_colours[self._turn_idx]
+        pin_id = action // self.N_CELLS
+        canon_dest = action % self.N_CELLS
+        actual_dest = int(self._canon_to_actual[colour][canon_dest])
+        return pin_id, actual_dest
 
     def _build_observation(self) -> np.ndarray:
         """
@@ -278,7 +344,7 @@ class ChineseCheckersEnv(gymnasium.Env):
 
         # CH 0: own pins
         for pin in self._pins[current]:
-            obs[0, pin.axialindex] = 1.0
+            obs[0, self._actual_to_canon[current][pin.axialindex]] = 1.0
 
         # CH 1–5: opponents, clockwise from current player
         cur_pos = COLOUR_ORDER.index(current)
@@ -287,21 +353,15 @@ class ChineseCheckersEnv(gymnasium.Env):
             candidate = COLOUR_ORDER[(cur_pos + offset) % 6]
             if candidate in self._active_colours:
                 for pin in self._pins[candidate]:
-                    obs[ch, pin.axialindex] = 1.0
+                    obs[ch, self._actual_to_canon[current][pin.axialindex]] = 1.0
             ch += 1
 
         # CH 6: own goal zone
         for idx in self._goal_zone_indices[current]:
-            obs[6, idx] = 1.0
+            obs[6, self._actual_to_canon[current][idx]] = 1.0
 
         # CH 7: distance field
-        cq, cr = self._goal_targets[current]
-        raw = np.array(
-            [self._axial_dist_sq(i, cq, cr) for i in range(self.N_CELLS)],
-            dtype=np.float32,
-        )
-        max_d = raw.max()
-        obs[7] = raw / max_d if max_d > 0 else raw
+        obs[7] = self._canonical_distance_field
 
         # CH 8: valid cells
         obs[8, :] = 1.0
@@ -325,7 +385,7 @@ class ChineseCheckersEnv(gymnasium.Env):
             for dest in pin.getPossibleMoves():
                 if in_goal and dest not in goal_zone:
                     continue  # cannot leave the goal zone once entered
-                mask[pin_id * self.N_CELLS + dest] = 1
+                mask[self.encode_action(pin_id, dest, current)] = 1
         return mask
 
     def _player_pos_hash(self, colour: str) -> int:
@@ -358,7 +418,12 @@ class ChineseCheckersEnv(gymnasium.Env):
 
     def _axial_dist_sq(self, idx: int, cq: float, cr: float) -> float:
         """Squared axial (Chebyshev-hex) distance from cell idx to float centroid."""
-        cell = self._board.cells[idx]
+        return self._axial_dist_sq_for_cells(self._board.cells, idx, cq, cr)
+
+    @staticmethod
+    def _axial_dist_sq_for_cells(cells, idx: int, cq: float, cr: float) -> float:
+        """Squared axial (Chebyshev-hex) distance using an explicit cell list."""
+        cell = cells[idx]
         dq = cell.q - cq
         dr = cell.r - cr
         ds = -dq - dr

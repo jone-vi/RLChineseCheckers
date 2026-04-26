@@ -50,9 +50,17 @@ def _dist_to_goal(cell_idx: int, goal_zone_indices, cells) -> int:
         return int(best) if best != float('inf') else 0
 
 
-def select_move(pins, cells, n_cells: int, goal_zone_indices, rng=None) -> int:
+def select_move(
+    pins,
+    cells,
+    n_cells: int,
+    goal_zone_indices,
+    rng=None,
+    encode_action=None,
+) -> int:
     """
     Core heuristic logic. Returns encoded action = pin_id * n_cells + dest_idx.
+    When called from the env, dest_idx is canonicalized by encode_action.
 
     Approach phase (pin outside goal zone):
         Select the move that most reduces the Chebyshev distance to the nearest
@@ -75,6 +83,8 @@ def select_move(pins, cells, n_cells: int, goal_zone_indices, rng=None) -> int:
         goal_zone_indices: set of cell indices for the player's goal corner
         rng:               optional random.Random for cycle-breaking;
                            if None greedy is always used (may cycle)
+        encode_action:     optional callable (pin_id, actual_dest) -> action id.
+                           The env passes canonical encoding here.
 
     Raises:
         RuntimeError: if truly no legal moves exist for any pin (caller must
@@ -84,6 +94,9 @@ def select_move(pins, cells, n_cells: int, goal_zone_indices, rng=None) -> int:
     best_reduction    = -float('inf')
     best_current_dist = -float('inf')
     all_legal         = []
+
+    if encode_action is None:
+        encode_action = lambda pin_id, dest: pin_id * n_cells + dest
 
     for pin_id, pin in enumerate(pins):
         in_goal      = pin.axialindex in goal_zone_indices
@@ -100,14 +113,15 @@ def select_move(pins, cells, n_cells: int, goal_zone_indices, rng=None) -> int:
 
             new_dist  = _dist_to_goal(dest, goal_zone_indices, cells)
             reduction = current_dist - new_dist
-            all_legal.append(pin_id * n_cells + dest)
+            encoded = encode_action(pin_id, dest)
+            all_legal.append(encoded)
 
             if (reduction > best_reduction or
                     (reduction == best_reduction and
                      current_dist > best_current_dist)):
                 best_reduction    = reduction
                 best_current_dist = current_dist
-                best_action       = pin_id * n_cells + dest
+                best_action       = encoded
 
     if best_action is None:
         # All remaining pins are at max depth inside the goal zone (no deeper
@@ -118,7 +132,7 @@ def select_move(pins, cells, n_cells: int, goal_zone_indices, rng=None) -> int:
                 continue
             for dest in pin.getPossibleMoves():
                 if dest in goal_zone_indices:
-                    return pin_id * n_cells + dest
+                    return encode_action(pin_id, dest)
         raise RuntimeError(
             "select_move: no legal moves — env should have auto-skipped this turn")
 
@@ -159,6 +173,7 @@ class HeuristicAgent:
             env.N_CELLS,
             goal_zone_indices=env._goal_zone_indices[colour],
             rng=self._rng,
+            encode_action=lambda pin_id, dest: env.encode_action(pin_id, dest, colour),
         )
 
 

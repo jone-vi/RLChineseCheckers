@@ -26,6 +26,8 @@ from src.env.chinese_checkers_env import ChineseCheckersEnv
 from src.models.network import ChineseCheckersNet
 from src.training.heuristic import HeuristicAgent
 
+ACTION_ENCODING = "canonical_destination_v2"
+
 
 def _latest_checkpoint() -> pathlib.Path | None:
     ckpt_dir = _ROOT / "checkpoints"
@@ -38,6 +40,11 @@ def _latest_checkpoint() -> pathlib.Path | None:
 
 def evaluate(ckpt_path: pathlib.Path, n_games: int, temperature: float = 0.3) -> None:
     ckpt = torch.load(ckpt_path, map_location="cpu")
+    if ckpt.get("action_encoding") != ACTION_ENCODING:
+        raise ValueError(
+            f"{ckpt_path} uses action_encoding={ckpt.get('action_encoding')!r}; "
+            "regenerate Stage 1/PPO checkpoints with the current canonical-action env."
+        )
     net = ChineseCheckersNet()
     net.load_state_dict(ckpt["state_dict"])
     net.eval()

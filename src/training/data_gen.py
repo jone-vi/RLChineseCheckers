@@ -6,7 +6,7 @@ to an HDF5 file for supervised pre-training.
 
 Dataset layout (data/stage1.h5):
     obs      float32 [N, 1089]  — board observation from acting player's POV
-    actions  int16   [N]        — encoded action = pin_id * 121 + dest_idx
+    actions  int16   [N]        — encoded action = pin_id * 121 + canonical_dest_idx
     outcomes float32 [N]        — game outcome for acting player in [-1, 1]
 
 Usage:
@@ -114,11 +114,31 @@ def run_one_game(
     # --- Assign outcomes ---
     final_rewards = info["rewards"]         # {colour: float} — last step's rewards
 
-    # In draws / truncations the rewards dict from the last step already has -2.0
-    # For wins the last step's rewards are +10/-10; for truncations -2.0 each.
-    # Normalise to [-1, 1] by dividing by 10.
-    outcome_map = {c: final_rewards[c] / 10.0 for c in env._active_colours}
-    is_draw = all(v == -2.0 for v in final_rewards.values())
+    # Supervised value targets should encode the competitive result, not the
+    # current PPO reward shaping.  Winners get +1.  If the game ends with a
+    # winner, all non-winners get the same negative rank target.  If it ends
+    # without a winner, rank players by remaining normalized distance.
+    winner = next((c for c, r in final_rewards.items() if r >= 10.0), None)
+    if winner is not None:
+        loser_target = -1.0 / max(1, len(env._active_colours) - 1)
+        outcome_map = {
+            c: 1.0 if c == winner else loser_target
+            for c in env._active_colours
+        }
+        is_draw = False
+    else:
+        ranked = sorted(
+            env._active_colours,
+            key=lambda c: env._prev_dist_sq[c] / max(env._d_max[c], 1.0),
+        )
+        if len(ranked) == 1:
+            outcome_map = {ranked[0]: 0.0}
+        else:
+            outcome_map = {
+                c: 1.0 - 2.0 * rank / (len(ranked) - 1)
+                for rank, c in enumerate(ranked)
+            }
+        is_draw = True
 
     # --- Sample 5 % ---
     n_sample = max(1, round(len(trajectory) * sample_rate))
@@ -223,6 +243,7 @@ def generate(
         f.attrs["sample_rate"] = sample_rate
         f.attrs["player_mix"]  = str(counts)
         f.attrs["seed"]        = seed
+        f.attrs["action_encoding"] = "canonical_destination_v2"
 
     draw_pct = 100.0 * draws / max(1, total_done)
     print(f"Done. {n:,} examples | mix: {mix_str} | "

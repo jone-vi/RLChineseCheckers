@@ -23,6 +23,8 @@ sys.path.insert(0, str(_ROOT))
 
 from src.models.network import ChineseCheckersNet
 
+ACTION_ENCODING = "canonical_destination_v2"
+
 
 class _FrozenAgent:
     """
@@ -82,7 +84,10 @@ class OpponentPool:
         Evicts the oldest agent if the pool is at capacity.
         """
         ckpt_path = self._ckpt_dir / f"pool_{step}.pt"
-        torch.save({"state_dict": state_dict, "step": step}, ckpt_path)
+        torch.save(
+            {"state_dict": state_dict, "step": step, "action_encoding": ACTION_ENCODING},
+            ckpt_path,
+        )
 
         agent = _FrozenAgent(state_dict, step=step)
         self._agents.append(agent)
@@ -92,6 +97,21 @@ class OpponentPool:
             print(f"[Pool] Evicted {evicted}")
 
         print(f"[Pool] Added step={step:,}  size={len(self._agents)}/{self._pool_size}")
+
+    @property
+    def heuristic(self):
+        """Return the stable heuristic opponent."""
+        return self._heuristic
+
+    def latest(self):
+        """Return the newest frozen network opponent, or None if the pool is empty."""
+        return self._agents[-1] if self._agents else None
+
+    def sample_frozen(self):
+        """Sample only from frozen network opponents, excluding the heuristic."""
+        if not self._agents:
+            return None
+        return self._rng.choice(self._agents)
 
     # ------------------------------------------------------------------
     # Opponent sampling

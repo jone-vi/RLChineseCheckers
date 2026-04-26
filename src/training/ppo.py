@@ -2,12 +2,12 @@
 Stage 2 PPO self-play training.
 
 Loads Stage 1 weights and refines via PPO with:
-- 8 parallel 2-player environments
+- 8 parallel mixed 2-6-player environments
 - 128-step rollouts per env → 1024+ transitions per update
 - GAE advantage estimation (γ=0.99, λ=0.95)
 - Clipped PPO objective (ε=0.2), entropy bonus, value loss
-- Opponent pool: 70% self-play / 30% vs frozen snapshots + heuristic
-- Pool promotion when win rate >55% over 50 eval games (every 100K steps)
+- Whole-game live self-play plus capped frozen-pool games
+- Pool promotion gated by 2-6p win and draw/limit rates
 - Checkpoints every 100K steps
 
 Exploration schedule per game:
@@ -32,7 +32,7 @@ import torch.nn as nn
 _ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_ROOT))
 
-from src.env.chinese_checkers_env import ChineseCheckersEnv
+from src.env.chinese_checkers_env import ChineseCheckersEnv, COLOUR_ORDER
 from src.models.network import ChineseCheckersNet
 from src.training.heuristic import HeuristicAgent
 from src.training.opponent_pool import OpponentPool
@@ -40,6 +40,7 @@ from src.training.opponent_pool import OpponentPool
 # ---------------------------------------------------------------------------
 # Hyperparameters
 # ---------------------------------------------------------------------------
+ACTION_ENCODING = "canonical_destination_v2"
 N_ENVS = 8
 ROLLOUT_STEPS = 128          # steps per env per update → ~1024 transitions
 GAMMA = 0.99
@@ -92,26 +93,30 @@ MINIBATCH = 64              # increased from 64; larger batches dilute rare high
                              # and halving update frequency per rollout (~4 vs ~8 with 64).
                              # Stays well below B≈512 so each rollout still gets meaningful updates.
 TARGET_KL = 0.01             # stop epoch early if policy changes too much
-POOL_MIX_RATIO = 1.0         # all games vs pool (Stage 1 + heuristic + promoted checkpoints); no self-play
+SELFPLAY_GAME_RATIO = 0.50   # whole-game live self-play.  All seats use the current net,
+                             # and all seats' trajectories train the shared policy.
+MAX_FROZEN_NET_OPPONENTS = 1 # in pool games, cap stochastic frozen nets per game.
+                             # The remaining seats use the heuristic, avoiding the
+                             # multiplayer compounding of draw-prone checkpoint policies.
 WARMUP_ROLLOUTS = 200         # ~200K steps: freeze policy, let value head calibrate on real game dynamics
                              # before policy updates begin.  200 (doubled from 100) because:
                              # (a) the first pool update at step ~100K changes opponent dynamics, causing
                              #     v_loss to spike — the head needs time to recalibrate on the new games
                              # (b) at 100 rollouts, v_loss was still 0.10+ when policy updates started,
                              #     producing noisy advantages that drove the entropy explosion
-CYCLE_TERMINAL_PENALTY = 1.0  # raw units; /REWARD_SCALE = -0.10 scaled.
-                               # Dense per-move revisit penalty (in _shaping_reward) provides the
-                               # primary targeted cycle signal; terminal only needs to be clearly
-                               # negative, not a 5× multiplier that poisons the entire trajectory
-                               # via GAE backpropagation (GAMMA^50 × 0.50 = 0.31 contamination
-                               # at step 50 before end vs 0.06 at 1.0 — 5× reduction).
+CYCLE_TERMINAL_PENALTY = 0.0  # draw/cycle outcomes are scored by distance progress.
+                              # In multiplayer, terminal cycle blame is usually non-local:
+                              # a frozen opponent can trigger a repeat that the learner could
+                              # not prevent.  Keep the targeted own-position revisit penalty in
+                              # the env, but do not poison whole trajectories with terminal blame.
 MAX_STEPS = 5_000_000
 REWARD_SCALE = 10.0          # divide raw rewards; terminal win→+1, loss→-1
 CKPT_EVERY = 100_000
 EVAL_GAMES = 50
-PROMOTE_RATE = 0.50          # was 0.55 — at first eval (step 200K), win_rate=0.540 missed promotion,
-                             # leaving pool at size=1 (Stage 1 only) for 100K rampup steps;
-                             # playing a single weak opponent all rampup inflates win% and suppresses cycle signal
+EVAL_GAMES_PER_COUNT = 8
+EVAL_PLAYER_COUNTS = (2, 3, 4, 5, 6)
+PROMOTE_MIN_WIN_BY_COUNT = {2: 0.50, 3: 0.30, 4: 0.20, 5: 0.15, 6: 0.12}
+PROMOTE_MAX_DRAW_RATE = 0.25  # max(cycle + limit) for every evaluated player count.
 POST_PROMO_WARMUP = 20       # rollouts of value-head-only update after each pool promotion.
 PLAYER_MIX: dict[int, float] = {2: 0.35, 3: 0.13, 4: 0.20, 5: 0.12, 6: 0.20}
                                # distribution of N-player game counts per episode.
@@ -175,25 +180,211 @@ def evaluate(
     Evaluate net (player 0, red) vs opponent (player 1, blue).
     Returns win rate for the learning network.
     """
+    metrics = _evaluate_match(
+        net,
+        opponent_factory=lambda _seat: opponent,
+        n_players=2,
+        n_games=n_games,
+        device=device,
+    )
+    return metrics["win_rate"]
+
+
+def _term_type(info: dict, truncated: bool) -> str:
+    rewards = info.get("rewards", {})
+    if truncated:
+        return "limit"
+    if rewards.get("red", 0.0) >= 10.0:
+        return "win"
+    if any(r >= 10.0 for c, r in rewards.items() if c != "red"):
+        return "loss"
+    return "cycle"
+
+
+def _evaluate_match(
+    net: ChineseCheckersNet,
+    opponent_factory,
+    n_players: int,
+    n_games: int,
+    device: str = "cpu",
+) -> dict[str, float]:
+    """Evaluate red/current net against a fixed opponent factory."""
     net.eval()
-    wins = 0
-    env = ChineseCheckersEnv(n_players=2)
+    env = ChineseCheckersEnv(n_players=n_players)
+    counts = {"win": 0, "loss": 0, "cycle": 0, "limit": 0}
+    progress_sum = 0.0
 
     for _ in range(n_games):
-        obs, info = env.reset()
-        for _ in range(800):
+        _, info = env.reset(n_players=n_players)
+        opponents = [opponent_factory(i) for i in range(n_players - 1)]
+        for _ in range(2000):
             if env._turn_idx == 0:
                 action = net.act(env, temperature=0.3)
             else:
-                action = opponent.act(env)
-            obs, _, terminated, truncated, info = env.step(action)
+                action = opponents[env._turn_idx - 1].act(env)
+            _, _, terminated, truncated, info = env.step(action)
             if terminated or truncated:
-                if info["rewards"]["red"] > info["rewards"]["blue"]:
-                    wins += 1
+                term = _term_type(info, truncated)
+                counts[term] += 1
+                red_r = info["rewards"].get("red", 0.0)
+                progress_sum += red_r - 10.0 if term == "win" else red_r
                 break
+        else:
+            counts["limit"] += 1
 
     net.train()
-    return wins / n_games
+    total = max(n_games, 1)
+    return {
+        "win_rate": counts["win"] / total,
+        "loss_rate": counts["loss"] / total,
+        "cycle_rate": counts["cycle"] / total,
+        "limit_rate": counts["limit"] / total,
+        "draw_rate": (counts["cycle"] + counts["limit"]) / total,
+        "progress": progress_sum / total,
+    }
+
+
+def _evaluate_promotion_suite(
+    net: ChineseCheckersNet,
+    pool: OpponentPool,
+    heuristic: HeuristicAgent,
+    device: str = "cpu",
+) -> tuple[bool, list[str]]:
+    """
+    Gate pool promotion on all player counts.
+
+    A checkpoint that is strong in 2p but causes 4-6p cycles should not be added
+    to the pool, because each additional frozen seat multiplies draw risk.
+    """
+    latest = pool.latest()
+    opponent_sets = [("heur", heuristic)]
+    if latest is not None:
+        opponent_sets.append(("pool", latest))
+
+    promote = True
+    lines: list[str] = []
+    for label, opponent in opponent_sets:
+        parts = []
+        for n_players in EVAL_PLAYER_COUNTS:
+            metrics = _evaluate_match(
+                net,
+                opponent_factory=lambda _seat, opp=opponent: opp,
+                n_players=n_players,
+                n_games=EVAL_GAMES_PER_COUNT,
+                device=device,
+            )
+            min_win = PROMOTE_MIN_WIN_BY_COUNT[n_players]
+            ok = (
+                metrics["win_rate"] >= min_win
+                and metrics["draw_rate"] <= PROMOTE_MAX_DRAW_RATE
+            )
+            promote = promote and ok
+            parts.append(
+                f"{n_players}p W={metrics['win_rate']:.2f} "
+                f"D={metrics['draw_rate']:.2f} P={metrics['progress']:.2f}"
+            )
+        lines.append(f"[Eval:{label}] " + " | ".join(parts))
+    return promote, lines
+
+
+def _sample_game_actors(
+    pool: OpponentPool,
+    net: ChineseCheckersNet,
+    n_players: int,
+) -> tuple[list, str]:
+    """
+    Choose who controls each seat.
+
+    Self-play games use the live net for every seat, yielding true parameter
+    sharing data.  Pool games always keep red/live, but cap frozen network
+    opponents and fill remaining seats with the heuristic.
+    """
+    if random.random() < SELFPLAY_GAME_RATIO:
+        return [net for _ in range(n_players)], "self"
+
+    actors = [net] + [pool.heuristic for _ in range(n_players - 1)]
+    n_frozen = min(MAX_FROZEN_NET_OPPONENTS, n_players - 1, len(pool))
+    if n_frozen > 0:
+        for seat in random.sample(range(1, n_players), n_frozen):
+            frozen = pool.sample_frozen()
+            if frozen is not None:
+                actors[seat] = frozen
+    return actors, "pool"
+
+
+def _bootstrap_value_for_colour(
+    net: ChineseCheckersNet,
+    env: ChineseCheckersEnv,
+    colour: str,
+    dev: torch.device,
+) -> float:
+    """Evaluate the current board from a specific player's perspective."""
+    if colour not in env._active_colours:
+        return 0.0
+    old_turn = env._turn_idx
+    try:
+        env._turn_idx = env._active_colours.index(colour)
+        mask = env._build_action_mask()
+        if mask.sum() == 0:
+            return 0.0
+        obs = env._build_observation()
+        with torch.no_grad():
+            obs_t = torch.from_numpy(obs).float().unsqueeze(0).to(dev)
+            mask_t = torch.from_numpy(mask).float().unsqueeze(0).to(dev)
+            _, val = net(obs_t, mask_t)
+        return float(val.item())
+    finally:
+        env._turn_idx = old_turn
+
+
+def _new_transition_buffers() -> dict[str, dict[str, list]]:
+    return {
+        colour: {
+            "obs": [],
+            "actions": [],
+            "logprobs": [],
+            "values": [],
+            "rewards": [],
+            "dones": [],
+            "masks": [],
+        }
+        for colour in COLOUR_ORDER
+    }
+
+
+def _credit_terminal_rewards(
+    env: ChineseCheckersEnv,
+    buffers_by_colour: dict[str, dict[str, list]],
+    actors_for_env: list,
+    net: ChineseCheckersNet,
+    info: dict,
+    acting_colour: str,
+    acting_was_live: bool,
+    truncated: bool,
+) -> None:
+    """Attach terminal rewards to each live player's latest transition."""
+    rewards = info.get("rewards", {})
+    is_cycle = (
+        not truncated
+        and all(r < 10.0 for r in rewards.values())
+    )
+    all_live = all(actor is net for actor in actors_for_env)
+
+    for seat, colour in enumerate(env._active_colours):
+        if actors_for_env[seat] is not net:
+            continue
+
+        buffers = buffers_by_colour[colour]
+        if not buffers["rewards"]:
+            continue
+
+        if colour != acting_colour or not acting_was_live:
+            buffers["rewards"][-1] += rewards.get(colour, 0.0) / REWARD_SCALE
+
+        if is_cycle and all_live and CYCLE_TERMINAL_PENALTY > 0.0:
+            buffers["rewards"][-1] -= CYCLE_TERMINAL_PENALTY / REWARD_SCALE
+
+        buffers["dones"][-1] = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -229,6 +420,11 @@ def train(
         if not resume_path.exists():
             raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
         ckpt = torch.load(resume_path, map_location=dev, weights_only=False)
+        if ckpt.get("action_encoding") != ACTION_ENCODING:
+            raise ValueError(
+                f"Resume checkpoint uses action_encoding={ckpt.get('action_encoding')!r}; "
+                "regenerate Stage 1 and PPO checkpoints with the canonical-action env."
+            )
         net.load_state_dict(ckpt["state_dict"])
         optimiser.load_state_dict(ckpt["optimiser"])
         resume_step = ckpt.get("step", 0)
@@ -242,6 +438,11 @@ def train(
                 "Run supervised.py first."
             )
         ckpt = torch.load(ckpt_path, map_location=dev, weights_only=False)
+        if ckpt.get("action_encoding") != ACTION_ENCODING:
+            raise ValueError(
+                f"Stage 1 checkpoint uses action_encoding={ckpt.get('action_encoding')!r}; "
+                "rerun data_gen.py and supervised.py before PPO."
+            )
         net.load_state_dict(ckpt["state_dict"])
         net.train()
         print(f"Loaded Stage 1 weights (epoch {ckpt.get('epoch', '?')})")
@@ -264,8 +465,8 @@ def train(
     # -- Per-env state --
     obs_buf: list = [None] * N_ENVS       # current observation after last step
     info_buf: list = [None] * N_ENVS      # current info after last step
-    opponents: list = [[] for _ in range(N_ENVS)]  # List[List[Agent]]: N-1 opponents per env
-    is_selfplay = [True] * N_ENVS   # True when ALL opponents are the learning net
+    actors: list = [[] for _ in range(N_ENVS)]  # List[List[Agent]]: one actor per seat
+    game_modes = ["self"] * N_ENVS
     n_players_env: list[int] = [2] * N_ENVS  # current player count for each env
 
     _mix_keys    = list(PLAYER_MIX.keys())
@@ -275,17 +476,11 @@ def train(
         n_p = random.choices(_mix_keys, weights=_mix_weights)[0]
         n_players_env[e] = n_p
         obs_buf[e], info_buf[e] = envs[e].reset(n_players=n_p)
-        opponents[e] = [pool.sample_opponent(net, mix_ratio=POOL_MIX_RATIO) for _ in range(n_p - 1)]
-        is_selfplay[e] = all(opp is net for opp in opponents[e])
+        actors[e], game_modes[e] = _sample_game_actors(pool, net, n_p)
 
-    # -- Per-env rollout storage (lists of numpy items, converted to arrays for GAE) --
-    per_env_obs = [[] for _ in range(N_ENVS)]
-    per_env_actions = [[] for _ in range(N_ENVS)]
-    per_env_logprobs = [[] for _ in range(N_ENVS)]
-    per_env_values = [[] for _ in range(N_ENVS)]
-    per_env_rewards = [[] for _ in range(N_ENVS)]
-    per_env_dones = [[] for _ in range(N_ENVS)]
-    per_env_masks = [[] for _ in range(N_ENVS)]
+    # -- Per-env, per-colour rollout storage.  Each live-controlled player gets
+    # its own value trajectory so GAE bootstraps from that player's perspective.
+    per_env_data = [_new_transition_buffers() for _ in range(N_ENVS)]
 
     # -- Tracking --
     ckpt_save_dir = _ROOT / ckpt_dir
@@ -313,13 +508,9 @@ def train(
         # ROLLOUT PHASE
         # ----------------------------------------------------------------
         for e in range(N_ENVS):
-            per_env_obs[e].clear()
-            per_env_actions[e].clear()
-            per_env_logprobs[e].clear()
-            per_env_values[e].clear()
-            per_env_rewards[e].clear()
-            per_env_dones[e].clear()
-            per_env_masks[e].clear()
+            for buffers in per_env_data[e].values():
+                for values in buffers.values():
+                    values.clear()
 
         net.eval()
 
@@ -330,9 +521,10 @@ def train(
                 mask = info["action_mask"]
 
                 colour = env._active_colours[env._turn_idx]
-                is_learning = (env._turn_idx == 0)
+                actor = actors[e][env._turn_idx]
+                is_live = (actor is net)
 
-                if is_learning:
+                if is_live:
                     move_count = env._move_counts[colour]
                     temp = _get_temperature(move_count)
 
@@ -365,30 +557,35 @@ def train(
                     next_obs, raw_r, done, trunc, next_info = env.step(action)
                     reward = raw_r / REWARD_SCALE
                     global_step += 1
-                    ep_rew_accum[e] += reward
+                    if colour == "red":
+                        ep_rew_accum[e] += reward
 
                     # Store transition
-                    per_env_obs[e].append(obs.copy())
-                    per_env_actions[e].append(action)
-                    per_env_logprobs[e].append(log_prob_val)
-                    per_env_values[e].append(value_val)
-                    per_env_rewards[e].append(reward)
-                    per_env_dones[e].append(float(done or trunc))
-                    per_env_masks[e].append(mask.copy())
-
-                    # Penalise cycle termination: no player won, game not truncated.
-                    # raw_r < 10.0 is sufficient when P0 acts: if cycle fired it's
-                    # because of a board-repeat (no winner), not P0 winning.
-                    if done and not trunc and raw_r < 10.0:
-                        per_env_rewards[e][-1] -= CYCLE_TERMINAL_PENALTY / REWARD_SCALE
+                    buffers = per_env_data[e][colour]
+                    buffers["obs"].append(obs.copy())
+                    buffers["actions"].append(action)
+                    buffers["logprobs"].append(log_prob_val)
+                    buffers["values"].append(value_val)
+                    buffers["rewards"].append(reward)
+                    buffers["dones"].append(float(done or trunc))
+                    buffers["masks"].append(mask.copy())
 
                     obs_buf[e] = next_obs
                     info_buf[e] = next_info
 
                     if done or trunc:
+                        if colour != "red":
+                            ep_rew_accum[e] += (
+                                next_info["rewards"].get("red", 0.0) / REWARD_SCALE
+                            )
+                        _credit_terminal_rewards(
+                            env, per_env_data[e], actors[e], net,
+                            next_info, colour, acting_was_live=True,
+                            truncated=trunc,
+                        )
                         _on_episode_end(
                             e, env, envs, obs_buf, info_buf,
-                            opponents, is_selfplay, pool, net,
+                            actors, game_modes, pool, net,
                             ep_wins, ep_rewards, ep_rew_accum, ep_term_types,
                             ep_progress,
                             next_info, done, trunc,
@@ -398,28 +595,29 @@ def train(
                         )
 
                 else:
-                    # Opponent acts — no buffer storage
-                    opp_idx = env._turn_idx - 1
-                    action = opponents[e][opp_idx].act(env)
+                    # Frozen/heuristic opponent acts; no transition is stored
+                    # unless the game ends, in which case live players' latest
+                    # transitions receive their terminal outcome.
+                    action = actor.act(env)
                     next_obs, raw_r, done, trunc, next_info = env.step(action)
                     global_step += 1
+                    if colour == "red":
+                        ep_rew_accum[e] += raw_r / REWARD_SCALE
                     obs_buf[e] = next_obs
                     info_buf[e] = next_info
                     if done or trunc:
-                        # Credit P0's last stored transition with the terminal outcome.
-                        # P0 doesn't act again, so this is the only way it receives
-                        # its loss/draw reward from the opponent ending the game.
-                        if per_env_rewards[e]:
-                            red_final = next_info["rewards"].get("red", 0.0) / REWARD_SCALE
-                            per_env_rewards[e][-1] += red_final
-                            per_env_dones[e][-1] = 1.0
-                            # Penalise cycle termination triggered by opponent's move.
-                            if (done and not trunc
-                                    and all(r < 10.0 for r in next_info["rewards"].values())):
-                                per_env_rewards[e][-1] -= CYCLE_TERMINAL_PENALTY / REWARD_SCALE
+                        if colour != "red":
+                            ep_rew_accum[e] += (
+                                next_info["rewards"].get("red", 0.0) / REWARD_SCALE
+                            )
+                        _credit_terminal_rewards(
+                            env, per_env_data[e], actors[e], net,
+                            next_info, colour, acting_was_live=False,
+                            truncated=trunc,
+                        )
                         _on_episode_end(
                             e, env, envs, obs_buf, info_buf,
-                            opponents, is_selfplay, pool, net,
+                            actors, game_modes, pool, net,
                             ep_wins, ep_rewards, ep_rew_accum, ep_term_types,
                             ep_progress,
                             next_info, done, trunc,
@@ -439,34 +637,30 @@ def train(
         all_returns: list[float] = []
         all_masks: list[np.ndarray] = []
 
-        for e in range(N_ENVS):
-            if len(per_env_obs[e]) == 0:
-                continue
+        for e, env in enumerate(envs):
+            for colour, buffers in per_env_data[e].items():
+                if len(buffers["obs"]) == 0:
+                    continue
 
-            rewards_e = np.array(per_env_rewards[e], dtype=np.float32)
-            values_e = np.array(per_env_values[e], dtype=np.float32)
-            dones_e = np.array(per_env_dones[e], dtype=np.float32)
+                rewards_e = np.array(buffers["rewards"], dtype=np.float32)
+                values_e = np.array(buffers["values"], dtype=np.float32)
+                dones_e = np.array(buffers["dones"], dtype=np.float32)
 
-            # Bootstrap value for the state after the last collected step
-            if per_env_dones[e][-1]:
-                last_value = 0.0
-            else:
-                with torch.no_grad():
-                    last_obs_t = torch.from_numpy(obs_buf[e]).float().unsqueeze(0).to(dev)
-                    last_mask_t = torch.from_numpy(
-                        info_buf[e]["action_mask"]
-                    ).float().unsqueeze(0).to(dev)
-                    _, last_val = net(last_obs_t, last_mask_t)
-                    last_value = float(last_val.item())
+                # Bootstrap from this same player's perspective, not the next
+                # seat to act.  This is the key difference from red-only PPO.
+                if dones_e[-1]:
+                    last_value = 0.0
+                else:
+                    last_value = _bootstrap_value_for_colour(net, env, colour, dev)
 
-            adv, ret = _compute_gae(rewards_e, values_e, dones_e, last_value)
+                adv, ret = _compute_gae(rewards_e, values_e, dones_e, last_value)
 
-            all_obs.extend(per_env_obs[e])
-            all_actions.extend(per_env_actions[e])
-            all_logprobs.extend(per_env_logprobs[e])
-            all_advantages.extend(adv.tolist())
-            all_returns.extend(ret.tolist())
-            all_masks.extend(per_env_masks[e])
+                all_obs.extend(buffers["obs"])
+                all_actions.extend(buffers["actions"])
+                all_logprobs.extend(buffers["logprobs"])
+                all_advantages.extend(adv.tolist())
+                all_returns.extend(ret.tolist())
+                all_masks.extend(buffers["masks"])
 
         if len(all_obs) == 0:
             continue
@@ -679,7 +873,12 @@ def train(
             if debug and len(all_advantages) > 0:
                 raw_adv = np.array(all_advantages)
                 raw_ret = np.array(all_returns)
-                val_arr = np.array([v for vs in per_env_values for v in vs])
+                val_arr = np.array([
+                    v
+                    for env_data in per_env_data
+                    for buffers in env_data.values()
+                    for v in buffers["values"]
+                ])
                 print(
                     f"  [debug] adv_raw  mean={raw_adv.mean():.3f} std={raw_adv.std():.3f}"
                     f" min={raw_adv.min():.3f} max={raw_adv.max():.3f}"
@@ -703,6 +902,7 @@ def train(
                     "state_dict": net.state_dict(),
                     "step": global_step,
                     "optimiser": optimiser.state_dict(),
+                    "action_encoding": ACTION_ENCODING,
                 },
                 ckpt_file,
             )
@@ -710,10 +910,13 @@ def train(
             last_ckpt_step = global_step
 
         if global_step - last_eval_step >= CKPT_EVERY:
-            eval_opp = pool._agents[-1] if len(pool) > 0 else heuristic
-            win_rate = evaluate(net, eval_opp, n_games=EVAL_GAMES, device=device)
-            print(f"[Eval] step={global_step:,}  win_rate={win_rate:.3f}")
-            if win_rate >= PROMOTE_RATE:
+            promote, eval_lines = _evaluate_promotion_suite(
+                net, pool, heuristic, device=device
+            )
+            print(f"[Eval] step={global_step:,}  promote={promote}")
+            for line in eval_lines:
+                print(line)
+            if promote:
                 pool.add(net.state_dict(), step=global_step)
                 post_promo_countdown = POST_PROMO_WARMUP
                 print(f"[Promo-warmup] Starting {POST_PROMO_WARMUP}-rollout value recalibration")
@@ -732,8 +935,8 @@ def _on_episode_end(
     envs: list,
     obs_buf: list,
     info_buf: list,
-    opponents: list,
-    is_selfplay: list,
+    actors: list,
+    game_modes: list,
     pool: OpponentPool,
     net: ChineseCheckersNet,
     ep_wins: list,
@@ -748,7 +951,7 @@ def _on_episode_end(
     n_players_env: list | None = None,
     n_players_hist: dict | None = None,
 ) -> None:
-    """Reset env, sample new opponent, record win/reward statistics."""
+    """Reset env, sample new actors, record win/reward statistics."""
     rewards = info.get("rewards", {})
     red_r = rewards.get("red", 0.0)
     win = float(red_r >= 10.0)
@@ -756,14 +959,7 @@ def _on_episode_end(
     ep_rewards.append(ep_rew_accum[e])
     ep_rew_accum[e] = 0.0
 
-    if truncated:
-        term_type = "limit"
-    elif red_r >= 10.0:
-        term_type = "win"
-    elif any(r >= 10.0 for c, r in rewards.items() if c != "red"):
-        term_type = "loss"
-    else:
-        term_type = "cycle"
+    term_type = _term_type(info, truncated)
     ep_term_types.append(term_type)
 
     # Progress = distance component of terminal reward (strips win bonus for wins)
@@ -779,13 +975,10 @@ def _on_episode_end(
         n_p = random.choices(list(PLAYER_MIX.keys()), weights=list(PLAYER_MIX.values()))[0]
         n_players_env[e] = n_p
         obs_buf[e], info_buf[e] = envs[e].reset(n_players=n_p)
-        opponents[e] = [pool.sample_opponent(net, mix_ratio=POOL_MIX_RATIO) for _ in range(n_p - 1)]
-        is_selfplay[e] = all(opp is net for opp in opponents[e])
+        actors[e], game_modes[e] = _sample_game_actors(pool, net, n_p)
     else:
         obs_buf[e], info_buf[e] = envs[e].reset()
-        opp = pool.sample_opponent(net, mix_ratio=POOL_MIX_RATIO)
-        opponents[e] = opp
-        is_selfplay[e] = (opp is net)
+        actors[e], game_modes[e] = _sample_game_actors(pool, net, envs[e].n_players)
 
 
 # ---------------------------------------------------------------------------
