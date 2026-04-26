@@ -105,13 +105,11 @@ MINIBATCH = 64              # increased from 64; larger batches dilute rare high
                              # and halving update frequency per rollout (~4 vs ~8 with 64).
                              # Stays well below B≈512 so each rollout still gets meaningful updates.
 TARGET_KL = 0.01             # stop epoch early if policy changes too much
-SELFPLAY_GAME_RATIO = 0.00   # whole-game live self-play.  All seats use the current net,
-                             # and all seats' trajectories train the shared policy.
-                             # Reduced from 0.50: in N-player self-play all N seats generate
-                             # transitions, so 50% self-play by game count → ~86% of batch
-                             # transitions come from self-play.  If the policy cycles, 86% of
-                             # training data is cyclic.  At 0.30 it's ~72%, and pool/heuristic
-                             # games (which never cycle) form a 28% stable baseline signal.
+OPPONENT_MODE_MIX: dict[str, float] = {
+    "heuristic": 0.45,       # red/live net vs heuristic-controlled opponent seats
+    "pool": 0.50,            # red/live net vs one frozen pool opponent + heuristic seats
+    "self": 0.05,            # all seats use the live net and train the shared policy
+}
 MAX_FROZEN_NET_OPPONENTS = 1 # in pool games, cap stochastic frozen nets per game.
                              # The remaining seats use the heuristic, avoiding the
                              # multiplayer compounding of draw-prone checkpoint policies.
@@ -313,20 +311,28 @@ def _sample_game_actors(
     """
     Choose who controls each seat.
 
-    Self-play games use the live net for every seat, yielding true parameter
-    sharing data.  Pool games always keep red/live, but cap frozen network
-    opponents and fill remaining seats with the heuristic.
+    Heuristic games keep red/live and use heuristic opponents. Pool games keep
+    red/live, insert one frozen network if available, and fill remaining seats
+    with the heuristic. Self-play games use the live net for every seat,
+    yielding true parameter sharing data.
     """
-    if random.random() < SELFPLAY_GAME_RATIO:
+    mode = random.choices(
+        list(OPPONENT_MODE_MIX.keys()),
+        weights=list(OPPONENT_MODE_MIX.values()),
+    )[0]
+
+    if mode == "self":
         return [net for _ in range(n_players)], "self"
 
     actors = [net] + [pool.heuristic for _ in range(n_players - 1)]
+    if mode == "heuristic" or len(pool) == 0:
+        return actors, "heuristic"
+
     n_frozen = min(MAX_FROZEN_NET_OPPONENTS, n_players - 1, len(pool))
-    if n_frozen > 0:
-        for seat in random.sample(range(1, n_players), n_frozen):
-            frozen = pool.sample_frozen()
-            if frozen is not None:
-                actors[seat] = frozen
+    for seat in random.sample(range(1, n_players), n_frozen):
+        frozen = pool.sample_frozen()
+        if frozen is not None:
+            actors[seat] = frozen
     return actors, "pool"
 
 
@@ -495,7 +501,7 @@ def train(
     obs_buf: list = [None] * N_ENVS       # current observation after last step
     info_buf: list = [None] * N_ENVS      # current info after last step
     actors: list = [[] for _ in range(N_ENVS)]  # List[List[Agent]]: one actor per seat
-    game_modes = ["self"] * N_ENVS
+    game_modes = ["heuristic"] * N_ENVS
     n_players_env: list[int] = [2] * N_ENVS  # current player count for each env
 
     _mix_keys    = list(PLAYER_MIX.keys())
@@ -533,6 +539,7 @@ def train(
     while global_step < max_steps:
 
         n_players_hist: dict[int, int] = {n: 0 for n in PLAYER_MIX}
+        mode_hist: dict[str, int] = {mode: 0 for mode in OPPONENT_MODE_MIX}
 
         # ----------------------------------------------------------------
         # ROLLOUT PHASE
@@ -621,6 +628,7 @@ def train(
                             global_step=global_step,
                             n_players_env=n_players_env,
                             n_players_hist=n_players_hist,
+                            mode_hist=mode_hist,
                         )
 
                 else:
@@ -652,6 +660,7 @@ def train(
                             global_step=global_step,
                             n_players_env=n_players_env,
                             n_players_hist=n_players_hist,
+                            mode_hist=mode_hist,
                         )
 
         # ----------------------------------------------------------------
@@ -913,6 +922,12 @@ def train(
             hist_str = (" | [" + " ".join(
                 f"{n}p:{c}" for n, c in sorted(n_players_hist.items()) if c > 0
             ) + "]") if hist_total > 0 else ""
+            mode_total = sum(mode_hist.values())
+            mode_str = (
+                f" | mode: H={mode_hist.get('heuristic', 0)}"
+                f" P={mode_hist.get('pool', 0)}"
+                f" S={mode_hist.get('self', 0)}"
+            ) if mode_total > 0 else ""
             print(
                 f"step={global_step:>9,}"
                 f" | win={recent_win:.3f}"
@@ -927,6 +942,7 @@ def train(
                 f" | {elapsed / 3600:.2f}h"
                 f"{clip_tag}"
                 f"{hist_str}"
+                f"{mode_str}"
             )
             if debug and len(all_advantages) > 0:
                 raw_adv = np.array(all_advantages)
@@ -1009,6 +1025,7 @@ def _on_episode_end(
     global_step: int = 0,
     n_players_env: list | None = None,
     n_players_hist: dict | None = None,
+    mode_hist: dict | None = None,
 ) -> None:
     """Reset env, sample new actors, record win/reward statistics."""
     rewards = info.get("rewards", {})
@@ -1029,6 +1046,10 @@ def _on_episode_end(
         ep_progress.append(red_r)
 
     # Record player count of completed game, then reset with a freshly sampled count.
+    if mode_hist is not None:
+        completed_mode = game_modes[e]
+        mode_hist[completed_mode] = mode_hist.get(completed_mode, 0) + 1
+
     if n_players_env is not None:
         if n_players_hist is not None:
             n_players_hist[n_players_env[e]] = n_players_hist.get(n_players_env[e], 0) + 1
