@@ -101,7 +101,7 @@ MINIBATCH = 64              # increased from 64; larger batches dilute rare high
                              # and halving update frequency per rollout (~4 vs ~8 with 64).
                              # Stays well below B≈512 so each rollout still gets meaningful updates.
 TARGET_KL = 0.01             # stop epoch early if policy changes too much
-SELFPLAY_GAME_RATIO = 0.30   # whole-game live self-play.  All seats use the current net,
+SELFPLAY_GAME_RATIO = 0.00   # whole-game live self-play.  All seats use the current net,
                              # and all seats' trajectories train the shared policy.
                              # Reduced from 0.50: in N-player self-play all N seats generate
                              # transitions, so 50% self-play by game count → ~86% of batch
