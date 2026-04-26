@@ -82,7 +82,7 @@ class ChineseCheckersEnv(gymnasium.Env):
     OBS_SIZE = N_CH * N_CELLS    # 1089
     ACT_SIZE = N_PINS * N_CELLS  # 1210
 
-    MOVE_LIMIT_PENALTY = 2.0  # penalty applied to all players when the 200-move limit is hit
+    MOVE_LIMIT_PENALTY = 0.0  # penalty applied to all players when the 200-move limit is hit; set >0 to activate
 
     def __init__(self, n_players: int = 2, render_mode: Optional[str] = None):
         super().__init__()
@@ -175,8 +175,9 @@ class ChineseCheckersEnv(gymnasium.Env):
 
         elif all(self._move_counts[c] >= 200 for c in self._active_colours):
             truncated = True
-            for c in self._active_colours:
-                rewards[c] -= self.MOVE_LIMIT_PENALTY
+            if self.MOVE_LIMIT_PENALTY:
+                for c in self._active_colours:
+                    rewards[c] -= self.MOVE_LIMIT_PENALTY
 
         else:
             rewards[acting] += self._shaping_reward(acting, d_before, d_after)

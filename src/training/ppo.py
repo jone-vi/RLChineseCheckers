@@ -52,13 +52,15 @@ CLIP_EPS_START = 0.003       # very tight start: Stage 1 policy is near-determin
                              # to cause a catastrophic entropy jump (0.13→1.0) at clip=0.01.
                              # 0.003 limits per-step ratio change to 0.3%, preventing the first-
                              # minibatch explosion. Ramps to 0.1 over POLICY_RAMPUP_ROLLOUTS.
-POLICY_RAMPUP_ROLLOUTS = 50  # rollouts after value warmup before encoder is unfrozen and clip hits CLIP_EPS
-                             # Phase sequence:
-                             #   warmup (WARMUP_ROLLOUTS): encoder+policy frozen, value head calibrates
-                             #   rampup (POLICY_RAMPUP_ROLLOUTS): policy head unfrozen, encoder still frozen,
-                             #     clip ramps 0.003→0.1  — prevents encoder-coupling drift (encoder changes
-                             #     shift policy head outputs even without policy gradient, bypassing clip+KL)
-                             #   full training: everything unfrozen, clip=0.1
+POLICY_RAMPUP_ROLLOUTS = 50  # rollouts to ramp clip_eps 0.003→0.1 after value warmup
+FREEZE_ENCODER = True        # keep encoder permanently frozen throughout PPO.
+                             # Stage 1 pretraining produced good features; unfreezing the encoder
+                             # mid-PPO destroys them: Adam has zero momentum for frozen params so the
+                             # first update is effectively sign(g)*LR, shattering the representation and
+                             # causing immediate policy collapse (observed: win 12%→1%, ent spike to 1.96).
+                             # Policy and value heads alone have sufficient capacity to learn good strategies
+                             # on top of fixed Stage 1 features.  If encoder fine-tuning is needed later,
+                             # restart from a stable checkpoint with a dedicated low-LR encoder warmup pass.
                              # 400 (doubled from 200) so the very tight CLIP_EPS_START=0.003 has enough
                              # rollouts to ramp to a useful clip value while staying conservative early.
 ENT_COEF = 0.0               # Stage 1 already has sufficient diversity (ent≈0.13); no bonus needed.
@@ -730,14 +732,9 @@ def train(
         else:
             clip_eps = CLIP_EPS
 
-        # Encoder freeze spans warmup AND rampup phases:
-        #   warmup: value head calibrates; encoder frozen so its features don't drift under the policy head
-        #   rampup: policy head adapts on fixed encoder representations; encoder still frozen so
-        #     value-loss gradient can't shift encoder features and implicitly re-shape the policy
-        #     distribution (this bypasses clip+KL and was the root cause of entropy explosion)
-        # Policy head is unfrozen as soon as warmup ends so it can start learning new strategies.
-        in_encoder_freeze = rollout_count <= WARMUP_ROLLOUTS + POLICY_RAMPUP_ROLLOUTS
-        if rollout_count == WARMUP_ROLLOUTS + POLICY_RAMPUP_ROLLOUTS + 1:
+        # Encoder freeze: permanently frozen when FREEZE_ENCODER=True, otherwise spans warmup+rampup.
+        in_encoder_freeze = FREEZE_ENCODER or rollout_count <= WARMUP_ROLLOUTS + POLICY_RAMPUP_ROLLOUTS
+        if not FREEZE_ENCODER and rollout_count == WARMUP_ROLLOUTS + POLICY_RAMPUP_ROLLOUTS + 1:
             print(f"[Rampup] Encoder unfrozen at step {global_step:,} — full training begins")
         in_post_promo_warmup = post_promo_countdown > 0
         net.encoder.requires_grad_(not in_encoder_freeze and not in_post_promo_warmup)
