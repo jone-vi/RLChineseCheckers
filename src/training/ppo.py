@@ -62,15 +62,23 @@ POLICY_RAMPUP_ROLLOUTS = 400  # rollouts after value warmup before encoder is un
 ENT_COEF = 0.0               # Stage 1 already has sufficient diversity (ent≈0.13); no bonus needed.
                              # Any push toward exploration is pure instability when fine-tuning from
                              # a supervised prior — the policy should refine, not explore.
-ENT_PENALTY_COEF = 5.0       # at entropy=0.6 (above ceiling 0.5): penalty=5.0×0.1=0.5, which is 5-10×
-                             # the typical policy_loss of 0.05-0.1 — strongly enforces the ceiling.
-MAX_ENT = 0.5                # hard ceiling; above this, recovery mode skips policy gradient entirely.
-ENT_FLOOR = 0.15             # minimum entropy; prevents the policy from becoming so concentrated
-                             # (ent→0.077 at win=99%) that any PPO update causes a spike.
-                             # Stage 1 starts at ent≈0.13; floor at 0.15 keeps the policy just above
-                             # that baseline so it's never in the fragile near-deterministic regime.
-ENT_FLOOR_COEF = 2.0         # at ent=0.077: floor penalty=2.0×0.073=0.15 ≈ 3× policy_loss — strong
-                             # enough to prevent near-zero entropy but not so large it kills learning.
+ENT_PENALTY_COEF = 5.0       # at entropy=0.4 (above ceiling 0.35): penalty=5.0×0.05=0.25, which is
+                             # 3-5× the typical policy_loss of 0.05-0.1 — strongly enforces the ceiling.
+MAX_ENT = 0.35               # hard ceiling (lowered from 0.5); above this, recovery mode skips policy
+                             # gradient entirely.  0.5 was too permissive — the spike reached 0.686
+                             # before recovery fired because the 10-rollout log average lagged the
+                             # actual per-minibatch entropy.  0.35 catches spikes in the same rollout
+                             # they begin, before the policy is substantially corrupted.
+ENT_FLOOR = 0.22             # minimum entropy (raised from 0.15); prevents the near-deterministic
+                             # regime (ent≈0.13) where the masking nonlinearity is unstable.  The
+                             # masking maps 1210 raw logits to ~50 valid actions; a tiny logit shift
+                             # can reroute large probability mass across the mask boundary, causing a
+                             # 0.15→0.69 entropy jump in one minibatch even with clip=0.012.  At
+                             # ent=0.22 the policy is still very concentrated (exp(0.22)=1.25 effective
+                             # branching factor vs exp(0.15)=1.16) but far enough from the boundary
+                             # that gradient steps don't trigger the nonlinearity catastrophically.
+ENT_FLOOR_COEF = 3.0         # at ent=0.15 (below floor 0.22): penalty=3.0×0.07=0.21 ≈ 4× policy_loss.
+                             # Stronger than before (was 2.0) to compensate for the raised floor.
 VF_COEF = 0.5
 LR = 1e-4                    # was 3e-4 — lower LR preserves Stage 1 knowledge during fine-tuning
 N_EPOCHS = 1                 # policy epochs per rollout — deliberately 1 to prevent large policy drift
