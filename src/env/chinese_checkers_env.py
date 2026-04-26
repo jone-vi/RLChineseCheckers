@@ -82,6 +82,8 @@ class ChineseCheckersEnv(gymnasium.Env):
     OBS_SIZE = N_CH * N_CELLS    # 1089
     ACT_SIZE = N_PINS * N_CELLS  # 1210
 
+    MOVE_LIMIT_PENALTY = 2.0  # penalty applied to all players when the 200-move limit is hit
+
     def __init__(self, n_players: int = 2, render_mode: Optional[str] = None):
         super().__init__()
         assert 2 <= n_players <= 6, "n_players must be between 2 and 6"
@@ -173,6 +175,8 @@ class ChineseCheckersEnv(gymnasium.Env):
 
         elif all(self._move_counts[c] >= 200 for c in self._active_colours):
             truncated = True
+            for c in self._active_colours:
+                rewards[c] -= self.MOVE_LIMIT_PENALTY
 
         else:
             rewards[acting] += self._shaping_reward(acting, d_before, d_after)
@@ -382,10 +386,10 @@ class ChineseCheckersEnv(gymnasium.Env):
 
         # 3. Per-move cost: small constant penalty applied every step.
         #    Present during warmup so the value head calibrates on it from the start —
-        #    no distribution shift when policy updates begin.  Cycling costs 0.002×N
+        #    no distribution shift when policy updates begin.  Cycling costs 0.005×N
         #    with zero distance benefit; forward moves offset the cost via shaping term 1.
-        #    200 moves × 0.002 = 0.4 raw total ≈ 4% of the win bonus (10.0).
-        r -= 0.002
+        #    200 moves × 0.005 = 1.0 raw total ≈ 10% of the win bonus (10.0).
+        r -= 0.005
 
         return r
 
