@@ -5,7 +5,7 @@ Loads Stage 1 weights and refines via PPO with:
 - 8 parallel mixed 2-6-player environments
 - 128-step rollouts per env → 1024+ transitions per update
 - GAE advantage estimation (γ=0.99, λ=0.95)
-- Clipped PPO objective (ε=0.2), entropy bonus, value loss
+- Conservative clipped PPO objective, Stage 1 KL anchor, value loss
 - Whole-game live self-play plus capped frozen-pool games
 - Pool promotion gated by 2-6p win and draw/limit rates
 - Checkpoints every 100K steps
@@ -20,6 +20,7 @@ Usage:
 """
 
 import argparse
+import copy
 import pathlib
 import random
 import sys
@@ -45,14 +46,14 @@ N_ENVS = 8
 ROLLOUT_STEPS = 128          # steps per env per update → ~1024 transitions
 GAMMA = 0.99
 GAE_LAMBDA = 0.95
-CLIP_EPS = 0.1               # fine-tuning from pretrained policy: 0.1, not 0.2
+CLIP_EPS = 0.03              # conservative fine-tuning from the Stage 1 policy
 CLIP_EPS_START = 0.003       # very tight start: Stage 1 policy is near-deterministic (ent≈0.13),
                              # and Adam's first step on the policy head is ≈±LR per parameter
                              # (no prior statistics → sign-normalised step), which is large enough
                              # to cause a catastrophic entropy jump (0.13→1.0) at clip=0.01.
                              # 0.003 limits per-step ratio change to 0.3%, preventing the first-
-                             # minibatch explosion. Ramps to 0.1 over POLICY_RAMPUP_ROLLOUTS.
-POLICY_RAMPUP_ROLLOUTS = 50  # rollouts to ramp clip_eps 0.003→0.1 after value warmup
+                             # minibatch explosion. Ramps to CLIP_EPS over POLICY_RAMPUP_ROLLOUTS.
+POLICY_RAMPUP_ROLLOUTS = 200 # rollouts to ramp clip_eps 0.003→0.03 after value warmup
 FREEZE_ENCODER = True        # keep encoder permanently frozen throughout PPO.
                              # Stage 1 pretraining produced good features; unfreezing the encoder
                              # mid-PPO destroys them: Adam has zero momentum for frozen params so the
@@ -69,7 +70,7 @@ ENT_COEF = 0.0               # Stage 1 already has sufficient diversity (ent≈0
 ENT_PENALTY_COEF = 5.0       # at entropy=1.7 (above ceiling 1.5): penalty=5.0×0.20=1.0, which is
                              # 3-5× the typical policy_loss of 0.05-0.1 — strongly enforces the ceiling.
 MAX_ENT = 2.0                # hard ceiling; above this, recovery mode skips policy gradient entirely.
-                             # Raised from 0.60 to 1.5: with WARMUP_ROLLOUTS=50 (51K steps), the policy
+                             # Raised from 0.60 to 1.5: with WARMUP_ROLLOUTS=200 (~205K steps), the policy
                              # head has had no time to lower its Stage 1 entropy before policy updates
                              # begin.  Measured post-warmup entropy is 1.07–1.65, so MAX_ENT=0.60
                              # fires recovery on 11/16 minibatches from rollout 1 — identical to the
@@ -92,7 +93,8 @@ ENT_FLOOR = 0.22             # minimum entropy (raised from 0.15); prevents the 
 ENT_FLOOR_COEF = 3.0         # at ent=0.15 (below floor 0.22): penalty=3.0×0.07=0.21 ≈ 4× policy_loss.
                              # Stronger than before (was 2.0) to compensate for the raised floor.
 VF_COEF = 0.5
-LR = 1e-4                    # was 3e-4 — lower LR preserves Stage 1 knowledge during fine-tuning
+LR = 3e-5                    # conservative LR preserves Stage 1 knowledge during fine-tuning
+POLICY_KL_COEF = 0.05        # keep PPO updates anchored to the Stage 1 supervised prior
 N_EPOCHS = 1                 # policy epochs per rollout — deliberately 1 to prevent large policy drift
 N_VALUE_EXTRA = 3            # additional value-head-only epochs per rollout (encoder+policy frozen).
                              # v_loss oscillated 0.07-0.17 throughout rampup because the policy changes every
@@ -113,14 +115,14 @@ SELFPLAY_GAME_RATIO = 0.00   # whole-game live self-play.  All seats use the cur
 MAX_FROZEN_NET_OPPONENTS = 1 # in pool games, cap stochastic frozen nets per game.
                              # The remaining seats use the heuristic, avoiding the
                              # multiplayer compounding of draw-prone checkpoint policies.
-WARMUP_ROLLOUTS = 50         # ~200K steps: freeze policy, let value head calibrate on real game dynamics
+WARMUP_ROLLOUTS = 200        # ~200K steps: freeze policy, let value head calibrate on real game dynamics
                              # before policy updates begin.  200 (doubled from 100) because:
                              # (a) the first pool update at step ~100K changes opponent dynamics, causing
                              #     v_loss to spike — the head needs time to recalibrate on the new games
                              # (b) at 100 rollouts, v_loss was still 0.10+ when policy updates started,
                              #     producing noisy advantages that drove the entropy explosion
 CYCLE_TERMINAL_PENALTY = 0.0  # disabled: cycle deterrence is handled entirely by the
-                              # per-move step cost in the env (0.002 raw per move).
+                              # per-move step cost in the env (0.01 raw per move).
                               # A terminal penalty would appear only after warmup (first
                               # cycle episode), causing a value-head distribution shift
                               # and entropy explosion.  The step cost is present from
@@ -454,6 +456,26 @@ def train(
         net.train()
         print(f"Loaded Stage 1 weights (epoch {ckpt.get('epoch', '?')})")
 
+    # Frozen supervised prior used as a policy anchor during PPO fine-tuning.
+    # PPO can otherwise steadily exploit noisy rollout advantages until the
+    # policy drifts into slower, lower-progress games.
+    reference_net = ChineseCheckersNet().to(dev)
+    reference_path = _ROOT / stage1_ckpt
+    if reference_path.exists():
+        reference_ckpt = torch.load(reference_path, map_location=dev, weights_only=False)
+        if reference_ckpt.get("action_encoding") != ACTION_ENCODING:
+            raise ValueError(
+                f"Stage 1 reference uses action_encoding={reference_ckpt.get('action_encoding')!r}; "
+                "rerun data_gen.py and supervised.py before PPO."
+            )
+        reference_net.load_state_dict(reference_ckpt["state_dict"])
+    else:
+        reference_net.load_state_dict(copy.deepcopy(net.state_dict()))
+        print("[Warn] Stage 1 reference checkpoint not found; anchoring PPO to resume weights")
+    reference_net.eval()
+    for p in reference_net.parameters():
+        p.requires_grad_(False)
+
     # -- Environments --
     envs = [ChineseCheckersEnv(n_players=2) for _ in range(N_ENVS)]
 
@@ -715,6 +737,7 @@ def train(
         sum_p_loss = 0.0
         sum_v_loss = 0.0
         sum_ent = 0.0
+        sum_policy_kl = 0.0
         n_updates = 0
         n_ent_recovery = 0   # minibatches that fired entropy recovery mode this rollout
         kl_exceeded = False
@@ -750,11 +773,16 @@ def train(
                 if len(idx) < 2:
                     continue
 
-                _, new_lp, ent, new_val = net.get_action_and_value(
-                    obs_batch[idx],
-                    masks_batch[idx],
-                    action=actions_batch[idx],
-                )
+                logits, new_val_raw = net(obs_batch[idx], masks_batch[idx])
+                dist = torch.distributions.Categorical(logits=logits)
+                new_lp = dist.log_prob(actions_batch[idx])
+                ent = dist.entropy()
+                new_val = new_val_raw.squeeze(-1)
+
+                with torch.no_grad():
+                    ref_logits, _ = reference_net(obs_batch[idx], masks_batch[idx])
+                    ref_dist = torch.distributions.Categorical(logits=ref_logits)
+                policy_kl = torch.distributions.kl_divergence(dist, ref_dist).mean()
 
                 ratio = torch.exp(new_lp - logprobs_batch[idx])
                 adv_mb = adv_batch[idx]
@@ -795,9 +823,10 @@ def train(
                     loss = VF_COEF * value_loss
                 elif in_ent_recovery:
                     loss = (ENT_PENALTY_COEF * torch.clamp(entropy_loss - MAX_ENT, min=0.0)
+                            + POLICY_KL_COEF * policy_kl
                             + VF_COEF * value_loss)
                 else:
-                    loss = policy_loss + VF_COEF * value_loss + ent_reg
+                    loss = policy_loss + VF_COEF * value_loss + ent_reg + POLICY_KL_COEF * policy_kl
 
                 optimiser.zero_grad()
                 loss.backward()
@@ -807,6 +836,7 @@ def train(
                 sum_p_loss += policy_loss.item()
                 sum_v_loss += value_loss.item()
                 sum_ent += entropy_loss.item()
+                sum_policy_kl += policy_kl.item()
                 n_updates += 1
 
                 # KL early stopping: skip during entropy recovery (need all minibatches
@@ -868,6 +898,7 @@ def train(
             p_loss_avg = sum_p_loss / max(n_updates, 1)
             v_loss_avg = sum_v_loss / max(n_updates, 1)
             ent_avg = sum_ent / max(n_updates, 1)
+            policy_kl_avg = sum_policy_kl / max(n_updates, 1)
             if in_warmup:
                 clip_tag = " | [warmup]"
             elif in_post_promo_warmup:
@@ -891,6 +922,7 @@ def train(
                 f" | p_loss={p_loss_avg:.4f}"
                 f" | v_loss={v_loss_avg:.4f}"
                 f" | ent={ent_avg:.4f}"
+                f" | kl_ref={policy_kl_avg:.4f}"
                 f" | term: W={pct_win:.0%} L={pct_loss:.0%} cyc={pct_cycle:.0%} lim={pct_limit:.0%}"
                 f" | {elapsed / 3600:.2f}h"
                 f"{clip_tag}"
