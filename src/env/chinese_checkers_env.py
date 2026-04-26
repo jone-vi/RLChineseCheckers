@@ -110,8 +110,6 @@ class ChineseCheckersEnv(gymnasium.Env):
         self._d_max:             Dict[str, float]   = {}
         self._prev_dist_sq:      Dict[str, float]   = {}
         self._pins_entered_goal: Dict[str, Set[int]]= {}
-        self._state_hash_counts: Dict[int, int]     = {}
-        self._player_pos_counts: Dict[str, Dict[int, int]] = {}
 
     # -----------------------------------------------------------------------
     # Gymnasium API
@@ -129,8 +127,6 @@ class ChineseCheckersEnv(gymnasium.Env):
         self._move_counts = {c: 0 for c in self._active_colours}
         self._still_playing      = list(self._active_colours)
         self._pins_entered_goal  = {c: set() for c in self._active_colours}
-        self._state_hash_counts  = {}
-        self._player_pos_counts  = {c: {} for c in self._active_colours}
 
         # Compute D_max from starting positions to deepest goal cell
         for colour in self._active_colours:
@@ -138,9 +134,6 @@ class ChineseCheckersEnv(gymnasium.Env):
             d = sum(self._axial_dist_sq(p.axialindex, cq, cr) for p in self._pins[colour])
             self._d_max[colour]       = max(d, 1.0)
             self._prev_dist_sq[colour] = d
-
-        h = self._board_state_hash()
-        self._state_hash_counts[h] = 1
 
         obs  = self._build_observation()
         mask = self._build_action_mask()
@@ -168,9 +161,6 @@ class ChineseCheckersEnv(gymnasium.Env):
         d_after = self._total_dist_sq(acting)
         self._prev_dist_sq[acting] = d_after
 
-        h = self._board_state_hash()
-        self._state_hash_counts[h] = self._state_hash_counts.get(h, 0) + 1
-
         # ---- Determine outcome -----------------------------------------
         rewards    = {c: 0.0 for c in self._active_colours}
         terminated = False
@@ -181,22 +171,11 @@ class ChineseCheckersEnv(gymnasium.Env):
             # Non-winners keep default 0.0 — no loss penalty
             terminated = True
 
-        elif self._state_hash_counts[h] >= (5 if self.n_players == 2 else 12):
-            # Full-board cycle termination is a safety valve.  Keep 2p fairly
-            # responsive, but be more patient in multiplayer because repeats can
-            # be caused by frozen opponents and are harder to credit locally.
-            terminated = True
-
         elif all(self._move_counts[c] >= 200 for c in self._active_colours):
             truncated = True
 
         else:
-            p_hash = self._player_pos_hash(acting)
-            self._player_pos_counts[acting][p_hash] = (
-                self._player_pos_counts[acting].get(p_hash, 0) + 1
-            )
-            pos_count = self._player_pos_counts[acting][p_hash]
-            rewards[acting] += self._shaping_reward(acting, d_before, d_after, pos_count)
+            rewards[acting] += self._shaping_reward(acting, d_before, d_after)
             self._advance_turn()
             # Skip over any players with no legal moves (e.g. all pins in goal
             # zone and no deeper empty cells).  Loop up to n_players-1 times so
@@ -387,12 +366,7 @@ class ChineseCheckersEnv(gymnasium.Env):
                 mask[self.encode_action(pin_id, dest, current)] = 1
         return mask
 
-    def _player_pos_hash(self, colour: str) -> int:
-        """Hash of this player's own piece positions only, for per-player cycle detection."""
-        return hash(tuple(sorted(p.axialindex for p in self._pins[colour])))
-
-    def _shaping_reward(self, colour: str, d_before: float,
-                        d_after: float, pos_count: int) -> float:
+    def _shaping_reward(self, colour: str, d_before: float, d_after: float) -> float:
         r = 0.0
 
         # 1. Distance reduction: positive when pins moved closer to goal
@@ -406,12 +380,12 @@ class ChineseCheckersEnv(gymnasium.Env):
                 r += 0.2
                 self._pins_entered_goal[colour].add(pin_id)
 
-        # 3. Revisit penalty: penalise returning to a previously-seen piece layout.
-        #    pos_count is per-player (own pieces only), so this fires only when THIS
-        #    player's pieces cycle back — not when the opponent causes a board repeat.
-        #    Capped at 5 visits; strong enough signal relative to the win reward.
-        if pos_count >= 2:
-            r -= 0.20 * min(pos_count - 1, 5)
+        # 3. Per-move cost: small constant penalty applied every step.
+        #    Present during warmup so the value head calibrates on it from the start —
+        #    no distribution shift when policy updates begin.  Cycling costs 0.002×N
+        #    with zero distance benefit; forward moves offset the cost via shaping term 1.
+        #    200 moves × 0.002 = 0.4 raw total ≈ 4% of the win bonus (10.0).
+        r -= 0.002
 
         return r
 
@@ -441,12 +415,6 @@ class ChineseCheckersEnv(gymnasium.Env):
             for p in self._pins[colour]
         )
 
-    def _board_state_hash(self) -> int:
-        """Stable hash of the full board state for cycle detection."""
-        return hash(tuple(
-            (c, tuple(sorted(p.axialindex for p in self._pins[c])))
-            for c in self._active_colours
-        ))
 
     def _advance_turn(self):
         self._turn_idx = (self._turn_idx + 1) % len(self._active_colours)
