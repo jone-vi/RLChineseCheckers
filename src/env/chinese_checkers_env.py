@@ -102,8 +102,12 @@ class ChineseCheckersEnv(gymnasium.Env):
     # Gymnasium API
     # -----------------------------------------------------------------------
 
-    def reset(self, seed=None, options=None):
+    def reset(self, seed=None, options=None, n_players: int | None = None):
         super().reset(seed=seed)
+        if n_players is not None:
+            assert 2 <= n_players <= 6, "n_players must be between 2 and 6"
+            self.n_players = n_players
+            self._active_colours = self._select_colours()
 
         self._init_board()
         self._turn_idx    = 0

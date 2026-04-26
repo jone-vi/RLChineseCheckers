@@ -21,6 +21,7 @@ Usage:
 
 import argparse
 import pathlib
+import random
 import sys
 import time
 
@@ -112,6 +113,9 @@ PROMOTE_RATE = 0.50          # was 0.55 — at first eval (step 200K), win_rate=
                              # leaving pool at size=1 (Stage 1 only) for 100K rampup steps;
                              # playing a single weak opponent all rampup inflates win% and suppresses cycle signal
 POST_PROMO_WARMUP = 20       # rollouts of value-head-only update after each pool promotion.
+PLAYER_MIX: dict[int, float] = {2: 0.35, 3: 0.13, 4: 0.20, 5: 0.12, 6: 0.20}
+                               # distribution of N-player game counts per episode.
+                               # Tilted toward 2p (simple, strong win signal) and 4p/6p.
                              # When a new checkpoint enters the pool, game dynamics shift suddenly:
                              # the learning policy now faces a competitive opponent, so typical
                              # returns drop (e.g. 0.99→0.50).  The value head, calibrated on the
@@ -258,16 +262,21 @@ def train(
     global_step = resume_step
 
     # -- Per-env state --
-    obs_buf: list = [None] * N_ENVS      # current observation after last step
-    info_buf: list = [None] * N_ENVS     # current info after last step
-    opponents: list = [None] * N_ENVS    # opponent agent for each env
-    is_selfplay = [True] * N_ENVS  # True when opponent IS the learning net
+    obs_buf: list = [None] * N_ENVS       # current observation after last step
+    info_buf: list = [None] * N_ENVS      # current info after last step
+    opponents: list = [[] for _ in range(N_ENVS)]  # List[List[Agent]]: N-1 opponents per env
+    is_selfplay = [True] * N_ENVS   # True when ALL opponents are the learning net
+    n_players_env: list[int] = [2] * N_ENVS  # current player count for each env
+
+    _mix_keys    = list(PLAYER_MIX.keys())
+    _mix_weights = list(PLAYER_MIX.values())
 
     for e in range(N_ENVS):
-        obs_buf[e], info_buf[e] = envs[e].reset()
-        opp = pool.sample_opponent(net, mix_ratio=POOL_MIX_RATIO)
-        opponents[e] = opp
-        is_selfplay[e] = (opp is net)
+        n_p = random.choices(_mix_keys, weights=_mix_weights)[0]
+        n_players_env[e] = n_p
+        obs_buf[e], info_buf[e] = envs[e].reset(n_players=n_p)
+        opponents[e] = [pool.sample_opponent(net, mix_ratio=POOL_MIX_RATIO) for _ in range(n_p - 1)]
+        is_selfplay[e] = all(opp is net for opp in opponents[e])
 
     # -- Per-env rollout storage (lists of numpy items, converted to arrays for GAE) --
     per_env_obs = [[] for _ in range(N_ENVS)]
@@ -297,6 +306,8 @@ def train(
     print(f"Starting PPO training. Max steps: {max_steps:,}")
 
     while global_step < max_steps:
+
+        n_players_hist: dict[int, int] = {n: 0 for n in PLAYER_MIX}
 
         # ----------------------------------------------------------------
         # ROLLOUT PHASE
@@ -365,10 +376,10 @@ def train(
                     per_env_dones[e].append(float(done or trunc))
                     per_env_masks[e].append(mask.copy())
 
-                    # Penalise cycle termination: neither player won, game not truncated.
-                    if (done and not trunc
-                            and raw_r < 10.0
-                            and next_info.get("rewards", {}).get("blue", 0.0) < 10.0):
+                    # Penalise cycle termination: no player won, game not truncated.
+                    # raw_r < 10.0 is sufficient when P0 acts: if cycle fired it's
+                    # because of a board-repeat (no winner), not P0 winning.
+                    if done and not trunc and raw_r < 10.0:
                         per_env_rewards[e][-1] -= CYCLE_TERMINAL_PENALTY / REWARD_SCALE
 
                     obs_buf[e] = next_obs
@@ -382,11 +393,14 @@ def train(
                             ep_progress,
                             next_info, done, trunc,
                             global_step=global_step,
+                            n_players_env=n_players_env,
+                            n_players_hist=n_players_hist,
                         )
 
                 else:
                     # Opponent acts — no buffer storage
-                    action = opponents[e].act(env)
+                    opp_idx = env._turn_idx - 1
+                    action = opponents[e][opp_idx].act(env)
                     next_obs, raw_r, done, trunc, next_info = env.step(action)
                     global_step += 1
                     obs_buf[e] = next_obs
@@ -401,8 +415,7 @@ def train(
                             per_env_dones[e][-1] = 1.0
                             # Penalise cycle termination triggered by opponent's move.
                             if (done and not trunc
-                                    and next_info["rewards"].get("red", 0.0) < 10.0
-                                    and next_info["rewards"].get("blue", 0.0) < 10.0):
+                                    and all(r < 10.0 for r in next_info["rewards"].values())):
                                 per_env_rewards[e][-1] -= CYCLE_TERMINAL_PENALTY / REWARD_SCALE
                         _on_episode_end(
                             e, env, envs, obs_buf, info_buf,
@@ -411,6 +424,8 @@ def train(
                             ep_progress,
                             next_info, done, trunc,
                             global_step=global_step,
+                            n_players_env=n_players_env,
+                            n_players_hist=n_players_hist,
                         )
 
         # ----------------------------------------------------------------
@@ -644,6 +659,10 @@ def train(
                 clip_tag = ""
             if n_ent_recovery > 0:
                 clip_tag += f" | [rec={n_ent_recovery}mb]"
+            hist_total = sum(n_players_hist.values())
+            hist_str = (" | [" + " ".join(
+                f"{n}p:{c}" for n, c in sorted(n_players_hist.items()) if c > 0
+            ) + "]") if hist_total > 0 else ""
             print(
                 f"step={global_step:>9,}"
                 f" | win={recent_win:.3f}"
@@ -655,6 +674,7 @@ def train(
                 f" | term: W={pct_win:.0%} L={pct_loss:.0%} cyc={pct_cycle:.0%} lim={pct_limit:.0%}"
                 f" | {elapsed / 3600:.2f}h"
                 f"{clip_tag}"
+                f"{hist_str}"
             )
             if debug and len(all_advantages) > 0:
                 raw_adv = np.array(all_advantages)
@@ -725,12 +745,13 @@ def _on_episode_end(
     terminated: bool,
     truncated: bool,
     global_step: int = 0,
+    n_players_env: list | None = None,
+    n_players_hist: dict | None = None,
 ) -> None:
     """Reset env, sample new opponent, record win/reward statistics."""
     rewards = info.get("rewards", {})
     red_r = rewards.get("red", 0.0)
-    blue_r = rewards.get("blue", 0.0)
-    win = float(red_r > blue_r)
+    win = float(red_r >= 10.0)
     ep_wins.append(win)
     ep_rewards.append(ep_rew_accum[e])
     ep_rew_accum[e] = 0.0
@@ -739,7 +760,7 @@ def _on_episode_end(
         term_type = "limit"
     elif red_r >= 10.0:
         term_type = "win"
-    elif blue_r >= 10.0:
+    elif any(r >= 10.0 for c, r in rewards.items() if c != "red"):
         term_type = "loss"
     else:
         term_type = "cycle"
@@ -751,10 +772,20 @@ def _on_episode_end(
     else:
         ep_progress.append(red_r)
 
-    obs_buf[e], info_buf[e] = envs[e].reset()
-    opp = pool.sample_opponent(net, mix_ratio=POOL_MIX_RATIO)
-    opponents[e] = opp
-    is_selfplay[e] = (opp is net)
+    # Record player count of completed game, then reset with a freshly sampled count.
+    if n_players_env is not None:
+        if n_players_hist is not None:
+            n_players_hist[n_players_env[e]] = n_players_hist.get(n_players_env[e], 0) + 1
+        n_p = random.choices(list(PLAYER_MIX.keys()), weights=list(PLAYER_MIX.values()))[0]
+        n_players_env[e] = n_p
+        obs_buf[e], info_buf[e] = envs[e].reset(n_players=n_p)
+        opponents[e] = [pool.sample_opponent(net, mix_ratio=POOL_MIX_RATIO) for _ in range(n_p - 1)]
+        is_selfplay[e] = all(opp is net for opp in opponents[e])
+    else:
+        obs_buf[e], info_buf[e] = envs[e].reset()
+        opp = pool.sample_opponent(net, mix_ratio=POOL_MIX_RATIO)
+        opponents[e] = opp
+        is_selfplay[e] = (opp is net)
 
 
 # ---------------------------------------------------------------------------
