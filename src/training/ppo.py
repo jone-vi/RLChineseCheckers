@@ -87,15 +87,19 @@ WARMUP_ROLLOUTS = 200         # ~200K steps: freeze policy, let value head calib
                              #     v_loss to spike — the head needs time to recalibrate on the new games
                              # (b) at 100 rollouts, v_loss was still 0.10+ when policy updates started,
                              #     producing noisy advantages that drove the entropy explosion
-CYCLE_TERMINAL_PENALTY = 1.0  # raw units; /REWARD_SCALE = -0.10 scaled.
-                               # Cycles previously matched loss reward (+0.01-0.03), giving the
-                               # agent no incentive to avoid them against strong pool opponents.
-                               # Now cycles < losses < wins, removing the rational cycle strategy.
+CYCLE_TERMINAL_PENALTY = 5.0  # raw units; /REWARD_SCALE = -0.50 scaled.
+                               # At win=84%, a penalty of 1.0 (-0.10 scaled) is overwhelmed by
+                               # the win signal: net gradient for actions shared between winning
+                               # and cycling games is still positive (0.84×+0.20 + 0.14×-0.90 = +0.04).
+                               # 5.0 (-0.50 scaled) makes the net gradient negative, forcing the
+                               # policy to actively break cycles rather than accept them.
 MAX_STEPS = 5_000_000
 REWARD_SCALE = 10.0          # divide raw rewards; terminal win→+1, loss→-1
 CKPT_EVERY = 100_000
 EVAL_GAMES = 50
-PROMOTE_RATE = 0.55
+PROMOTE_RATE = 0.50          # was 0.55 — at first eval (step 200K), win_rate=0.540 missed promotion,
+                             # leaving pool at size=1 (Stage 1 only) for 100K rampup steps;
+                             # playing a single weak opponent all rampup inflates win% and suppresses cycle signal
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +268,7 @@ def train(
     ep_wins: list[float] = []     # rolling window: 1=win, 0=loss for learning net
     ep_rewards: list[float] = []  # rolling window: per-episode total reward
     ep_term_types: list[str] = [] # rolling window: "win", "loss", "cycle", "limit"
+    ep_progress: list[float] = [] # rolling window: distance progress reward (proxy for piece advancement)
 
     # Per-env episode reward accumulator
     ep_rew_accum = [0.0] * N_ENVS
@@ -354,6 +359,7 @@ def train(
                             e, env, envs, obs_buf, info_buf,
                             opponents, is_selfplay, pool, net,
                             ep_wins, ep_rewards, ep_rew_accum, ep_term_types,
+                            ep_progress,
                             next_info, done, trunc,
                             global_step=global_step,
                         )
@@ -382,6 +388,7 @@ def train(
                             e, env, envs, obs_buf, info_buf,
                             opponents, is_selfplay, pool, net,
                             ep_wins, ep_rewards, ep_rew_accum, ep_term_types,
+                            ep_progress,
                             next_info, done, trunc,
                             global_step=global_step,
                         )
@@ -587,6 +594,7 @@ def train(
         if rollout_count % log_every == 0:
             recent_win = np.mean(ep_wins[-100:]) if ep_wins else 0.0
             recent_rew = np.mean(ep_rewards[-100:]) if ep_rewards else 0.0
+            recent_prog = np.mean(ep_progress[-100:]) if ep_progress else 0.0
             elapsed = time.perf_counter() - t_start
             recent_types = ep_term_types[-100:]
             n_recent = max(len(recent_types), 1)
@@ -607,12 +615,13 @@ def train(
                 f"step={global_step:>9,}"
                 f" | win={recent_win:.3f}"
                 f" | rew={recent_rew:.3f}"
+                f" | prog={recent_prog:.3f}"
                 f" | p_loss={p_loss_avg:.4f}"
                 f" | v_loss={v_loss_avg:.4f}"
                 f" | ent={ent_avg:.4f}"
-                f"{clip_tag}"
                 f" | term: W={pct_win:.0%} L={pct_loss:.0%} cyc={pct_cycle:.0%} lim={pct_limit:.0%}"
                 f" | {elapsed / 3600:.2f}h"
+                f"{clip_tag}"
             )
             if debug and len(all_advantages) > 0:
                 raw_adv = np.array(all_advantages)
@@ -676,6 +685,7 @@ def _on_episode_end(
     ep_rewards: list,
     ep_rew_accum: list,
     ep_term_types: list,
+    ep_progress: list,
     info: dict,
     terminated: bool,
     truncated: bool,
@@ -699,6 +709,12 @@ def _on_episode_end(
     else:
         term_type = "cycle"
     ep_term_types.append(term_type)
+
+    # Progress = distance component of terminal reward (strips win bonus for wins)
+    if term_type == "win":
+        ep_progress.append(red_r - 10.0)
+    else:
+        ep_progress.append(red_r)
 
     obs_buf[e], info_buf[e] = envs[e].reset()
     opp = pool.sample_opponent(net, mix_ratio=POOL_MIX_RATIO)
