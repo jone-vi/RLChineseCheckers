@@ -500,6 +500,7 @@ def train(
     ep_rewards: list[float] = []  # rolling window: per-episode total reward
     ep_term_types: list[str] = [] # rolling window: "win", "loss", "cycle", "limit"
     ep_progress: list[float] = [] # rolling window: distance progress reward (proxy for piece advancement)
+    ep_move_counts: list[float] = []  # rolling window: total moves per completed episode
 
     # Per-env episode reward accumulator
     ep_rew_accum = [0.0] * N_ENVS
@@ -593,7 +594,7 @@ def train(
                             e, env, envs, obs_buf, info_buf,
                             actors, game_modes, pool, net,
                             ep_wins, ep_rewards, ep_rew_accum, ep_term_types,
-                            ep_progress,
+                            ep_progress, ep_move_counts,
                             next_info, done, trunc,
                             global_step=global_step,
                             n_players_env=n_players_env,
@@ -624,7 +625,7 @@ def train(
                             e, env, envs, obs_buf, info_buf,
                             actors, game_modes, pool, net,
                             ep_wins, ep_rewards, ep_rew_accum, ep_term_types,
-                            ep_progress,
+                            ep_progress, ep_move_counts,
                             next_info, done, trunc,
                             global_step=global_step,
                             n_players_env=n_players_env,
@@ -856,6 +857,7 @@ def train(
             recent_win = np.mean(ep_wins[-100:]) if ep_wins else 0.0
             recent_rew = np.mean(ep_rewards[-100:]) if ep_rewards else 0.0
             recent_prog = np.mean(ep_progress[-100:]) if ep_progress else 0.0
+            recent_moves = np.mean(ep_move_counts[-100:]) if ep_move_counts else 0.0
             elapsed = time.perf_counter() - t_start
             recent_types = ep_term_types[-100:]
             n_recent = max(len(recent_types), 1)
@@ -885,6 +887,7 @@ def train(
                 f" | win={recent_win:.3f}"
                 f" | rew={recent_rew:.3f}"
                 f" | prog={recent_prog:.3f}"
+                f" | moves={recent_moves:.1f}"
                 f" | p_loss={p_loss_avg:.4f}"
                 f" | v_loss={v_loss_avg:.4f}"
                 f" | ent={ent_avg:.4f}"
@@ -967,6 +970,7 @@ def _on_episode_end(
     ep_rew_accum: list,
     ep_term_types: list,
     ep_progress: list,
+    ep_move_counts: list,
     info: dict,
     terminated: bool,
     truncated: bool,
@@ -981,6 +985,7 @@ def _on_episode_end(
     ep_wins.append(win)
     ep_rewards.append(ep_rew_accum[e])
     ep_rew_accum[e] = 0.0
+    ep_move_counts.append(float(sum(env._move_counts.values())))
 
     term_type = _term_type(info, truncated)
     ep_term_types.append(term_type)
