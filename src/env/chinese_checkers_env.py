@@ -195,19 +195,25 @@ class ChineseCheckersEnv(gymnasium.Env):
             self._player_pos_counts[acting][p_hash] = (
                 self._player_pos_counts[acting].get(p_hash, 0) + 1
             )
-            rewards[acting] += self._shaping_reward(
-                acting, d_before, d_after, self._player_pos_counts[acting][p_hash]
-            )
-            self._advance_turn()
-            # Skip over any players with no legal moves (e.g. all pins in goal
-            # zone and no deeper empty cells).  Loop up to n_players-1 times so
-            # we don't spin forever; if everyone is stuck, terminate as a draw.
-            for _ in range(self.n_players - 1):
-                if self._build_action_mask().sum() > 0:
-                    break
-                self._advance_turn()
-            else:
+            pos_count = self._player_pos_counts[acting][p_hash]
+            rewards[acting] += self._shaping_reward(acting, d_before, d_after, pos_count)
+
+            if pos_count >= 4:
+                # Per-player cycle: this player's own pieces returned to the same
+                # configuration 4 times.  Terminate before the full-board safety
+                # valve so the signal is clearly attributed to the cycler.
                 terminated = True
+            else:
+                self._advance_turn()
+                # Skip over any players with no legal moves (e.g. all pins in goal
+                # zone and no deeper empty cells).  Loop up to n_players-1 times so
+                # we don't spin forever; if everyone is stuck, terminate as a draw.
+                for _ in range(self.n_players - 1):
+                    if self._build_action_mask().sum() > 0:
+                        break
+                    self._advance_turn()
+                else:
+                    terminated = True
 
         if terminated or truncated:
             for c in self._active_colours:
@@ -410,9 +416,9 @@ class ChineseCheckersEnv(gymnasium.Env):
         # 3. Revisit penalty: penalise returning to a previously-seen piece layout.
         #    pos_count is per-player (own pieces only), so this fires only when THIS
         #    player's pieces cycle back — not when the opponent causes a board repeat.
-        #    Capped at 3 visits to avoid overwhelming the win signal in heavy-cycle games.
+        #    Capped at 5 visits; strong enough signal relative to the win reward.
         if pos_count >= 2:
-            r -= 0.10 * min(pos_count - 1, 3)
+            r -= 0.20 * min(pos_count - 1, 5)
 
         return r
 

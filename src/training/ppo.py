@@ -117,11 +117,12 @@ WARMUP_ROLLOUTS = 50         # ~200K steps: freeze policy, let value head calibr
                              #     v_loss to spike — the head needs time to recalibrate on the new games
                              # (b) at 100 rollouts, v_loss was still 0.10+ when policy updates started,
                              #     producing noisy advantages that drove the entropy explosion
-CYCLE_TERMINAL_PENALTY = 1.0  # draw/cycle outcomes are scored by distance progress.
-                              # In multiplayer, terminal cycle blame is usually non-local:
-                              # a frozen opponent can trigger a repeat that the learner could
-                              # not prevent.  Keep the targeted own-position revisit penalty in
-                              # the env, but do not poison whole trajectories with terminal blame.
+CYCLE_TERMINAL_PENALTY = 1.0  # applied to live players whose own piece positions cycled
+                              # (any pos_count >= 2 in _player_pos_counts).  Per-player
+                              # attribution avoids penalising for cycles triggered entirely
+                              # by an opponent.  Combined with the per-move revisit shaping
+                              # penalty in the env, this makes the cycle signal non-zero
+                              # even in pool games (where all_live=False).
 MAX_STEPS = 5_000_000
 REWARD_SCALE = 10.0          # divide raw rewards; terminal win→+1, loss→-1
 CKPT_EVERY = 100_000
@@ -394,8 +395,14 @@ def _credit_terminal_rewards(
         if colour != acting_colour or not acting_was_live:
             buffers["rewards"][-1] += rewards.get(colour, 0.0) / REWARD_SCALE
 
-        if is_cycle and all_live and CYCLE_TERMINAL_PENALTY > 0.0:
-            buffers["rewards"][-1] -= CYCLE_TERMINAL_PENALTY / REWARD_SCALE
+        if is_cycle and CYCLE_TERMINAL_PENALTY > 0.0:
+            # Penalise any live player whose own piece positions cycled.
+            # Checking per-player counts avoids blaming players for cycles
+            # triggered entirely by an opponent's repeated positions.
+            player_pos_counts = env._player_pos_counts.get(colour, {})
+            player_contributed = any(v >= 2 for v in player_pos_counts.values())
+            if player_contributed or all_live:
+                buffers["rewards"][-1] -= CYCLE_TERMINAL_PENALTY / REWARD_SCALE
 
         buffers["dones"][-1] = 1.0
 
