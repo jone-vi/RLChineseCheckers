@@ -86,7 +86,7 @@ N_VALUE_EXTRA = 3            # additional value-head-only epochs per rollout (en
                              # v_loss oscillated 0.07-0.17 throughout rampup because the policy changes every
                              # rollout and 1 epoch of value updates can't track it; extra epochs hold it low,
                              # producing accurate advantages and preventing the noisy-grad→entropy-drift loop.
-MINIBATCH = 256              # increased from 64; larger batches dilute rare high-negative-advantage
+MINIBATCH = 128              # increased from 64; larger batches dilute rare high-negative-advantage
                              # loss samples (2% of episodes), reducing per-step gradient variance
                              # and halving update frequency per rollout (~4 vs ~8 with 64).
                              # Stays well below B≈512 so each rollout still gets meaningful updates.
@@ -111,6 +111,14 @@ EVAL_GAMES = 50
 PROMOTE_RATE = 0.50          # was 0.55 — at first eval (step 200K), win_rate=0.540 missed promotion,
                              # leaving pool at size=1 (Stage 1 only) for 100K rampup steps;
                              # playing a single weak opponent all rampup inflates win% and suppresses cycle signal
+POST_PROMO_WARMUP = 20       # rollouts of value-head-only update after each pool promotion.
+                             # When a new checkpoint enters the pool, game dynamics shift suddenly:
+                             # the learning policy now faces a competitive opponent, so typical
+                             # returns drop (e.g. 0.99→0.50).  The value head, calibrated on the
+                             # old high-win games (V(s)≈0.9), produces systematically wrong
+                             # advantages for the new regime, pushing the policy in the wrong
+                             # direction and cascading into cycles.  20 rollouts (~20K steps) lets
+                             # v_loss converge to the new distribution before policy updates resume.
 
 
 # ---------------------------------------------------------------------------
@@ -274,6 +282,7 @@ def train(
     ckpt_save_dir = _ROOT / ckpt_dir
     ckpt_save_dir.mkdir(parents=True, exist_ok=True)
     rollout_count = 0
+    post_promo_countdown = 0   # rollouts remaining in post-promotion value warmup (0 = inactive)
     last_ckpt_step = resume_step
     last_eval_step = resume_step
     ep_wins: list[float] = []     # rolling window: 1=win, 0=loss for learning net
@@ -495,8 +504,9 @@ def train(
         in_encoder_freeze = rollout_count <= WARMUP_ROLLOUTS + POLICY_RAMPUP_ROLLOUTS
         if rollout_count == WARMUP_ROLLOUTS + POLICY_RAMPUP_ROLLOUTS + 1:
             print(f"[Rampup] Encoder unfrozen at step {global_step:,} — full training begins")
-        net.encoder.requires_grad_(not in_encoder_freeze)
-        net.policy_head.requires_grad_(not in_warmup)
+        in_post_promo_warmup = post_promo_countdown > 0
+        net.encoder.requires_grad_(not in_encoder_freeze and not in_post_promo_warmup)
+        net.policy_head.requires_grad_(not in_warmup and not in_post_promo_warmup)
 
         for _ in range(N_EPOCHS):
             if kl_exceeded:
@@ -548,7 +558,7 @@ def train(
                 # Policy gradient is frozen — Stage 1 value head was trained on heuristic games and
                 # mispredicts returns in Stage 1 self-play, producing large noisy advantages that
                 # corrupt the policy in the very first rollout if left unchecked.
-                if in_warmup:
+                if in_warmup or in_post_promo_warmup:
                     loss = VF_COEF * value_loss
                 elif in_ent_recovery:
                     loss = (ENT_PENALTY_COEF * torch.clamp(entropy_loss - MAX_ENT, min=0.0)
@@ -596,8 +606,13 @@ def train(
                 (VF_COEF * extra_v_loss).backward()
                 nn.utils.clip_grad_norm_(net.parameters(), max_norm=0.5)
                 optimiser.step()
-        net.encoder.requires_grad_(not in_encoder_freeze)
-        net.policy_head.requires_grad_(not in_warmup)
+        net.encoder.requires_grad_(not in_encoder_freeze and not in_post_promo_warmup)
+        net.policy_head.requires_grad_(not in_warmup and not in_post_promo_warmup)
+
+        if in_post_promo_warmup:
+            post_promo_countdown -= 1
+            if post_promo_countdown == 0:
+                print(f"[Promo-warmup] Value recalibration complete at step {global_step:,} — policy updates resumed")
 
         rollout_count += 1
 
@@ -621,6 +636,8 @@ def train(
             ent_avg = sum_ent / max(n_updates, 1)
             if in_warmup:
                 clip_tag = " | [warmup]"
+            elif in_post_promo_warmup:
+                clip_tag = f" | [promo-warmup={post_promo_countdown} left]"
             elif in_encoder_freeze:
                 clip_tag = f" | clip={clip_eps:.3f}[enc-frz]"
             else:
@@ -678,6 +695,8 @@ def train(
             print(f"[Eval] step={global_step:,}  win_rate={win_rate:.3f}")
             if win_rate >= PROMOTE_RATE:
                 pool.add(net.state_dict(), step=global_step)
+                post_promo_countdown = POST_PROMO_WARMUP
+                print(f"[Promo-warmup] Starting {POST_PROMO_WARMUP}-rollout value recalibration")
             last_eval_step = global_step
 
     print(f"Training complete. Total steps: {global_step:,}")
