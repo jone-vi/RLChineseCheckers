@@ -197,23 +197,16 @@ class ChineseCheckersEnv(gymnasium.Env):
             )
             pos_count = self._player_pos_counts[acting][p_hash]
             rewards[acting] += self._shaping_reward(acting, d_before, d_after, pos_count)
-
-            if pos_count >= 4:
-                # Per-player cycle: this player's own pieces returned to the same
-                # configuration 4 times.  Terminate before the full-board safety
-                # valve so the signal is clearly attributed to the cycler.
-                terminated = True
-            else:
+            self._advance_turn()
+            # Skip over any players with no legal moves (e.g. all pins in goal
+            # zone and no deeper empty cells).  Loop up to n_players-1 times so
+            # we don't spin forever; if everyone is stuck, terminate as a draw.
+            for _ in range(self.n_players - 1):
+                if self._build_action_mask().sum() > 0:
+                    break
                 self._advance_turn()
-                # Skip over any players with no legal moves (e.g. all pins in goal
-                # zone and no deeper empty cells).  Loop up to n_players-1 times so
-                # we don't spin forever; if everyone is stuck, terminate as a draw.
-                for _ in range(self.n_players - 1):
-                    if self._build_action_mask().sum() > 0:
-                        break
-                    self._advance_turn()
-                else:
-                    terminated = True
+            else:
+                terminated = True
 
         if terminated or truncated:
             for c in self._active_colours:
