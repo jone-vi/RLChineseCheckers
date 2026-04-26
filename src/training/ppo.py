@@ -95,12 +95,12 @@ WARMUP_ROLLOUTS = 200         # ~200K steps: freeze policy, let value head calib
                              #     v_loss to spike — the head needs time to recalibrate on the new games
                              # (b) at 100 rollouts, v_loss was still 0.10+ when policy updates started,
                              #     producing noisy advantages that drove the entropy explosion
-CYCLE_TERMINAL_PENALTY = 5.0  # raw units; /REWARD_SCALE = -0.50 scaled.
-                               # At win=84%, a penalty of 1.0 (-0.10 scaled) is overwhelmed by
-                               # the win signal: net gradient for actions shared between winning
-                               # and cycling games is still positive (0.84×+0.20 + 0.14×-0.90 = +0.04).
-                               # 5.0 (-0.50 scaled) makes the net gradient negative, forcing the
-                               # policy to actively break cycles rather than accept them.
+CYCLE_TERMINAL_PENALTY = 1.0  # raw units; /REWARD_SCALE = -0.10 scaled.
+                               # Dense per-move revisit penalty (in _shaping_reward) provides the
+                               # primary targeted cycle signal; terminal only needs to be clearly
+                               # negative, not a 5× multiplier that poisons the entire trajectory
+                               # via GAE backpropagation (GAMMA^50 × 0.50 = 0.31 contamination
+                               # at step 50 before end vs 0.06 at 1.0 — 5× reduction).
 MAX_STEPS = 5_000_000
 REWARD_SCALE = 10.0          # divide raw rewards; terminal win→+1, loss→-1
 CKPT_EVERY = 100_000
@@ -466,6 +466,7 @@ def train(
         sum_v_loss = 0.0
         sum_ent = 0.0
         n_updates = 0
+        n_ent_recovery = 0   # minibatches that fired entropy recovery mode this rollout
         kl_exceeded = False
 
         in_warmup = rollout_count <= WARMUP_ROLLOUTS
@@ -537,6 +538,8 @@ def train(
                 # Avoids the deadlock of break-before-update: penalty actively drives
                 # entropy back below MAX_ENT rather than halting all learning.
                 in_ent_recovery = (not in_warmup) and (entropy_loss.item() > MAX_ENT)
+                if in_ent_recovery:
+                    n_ent_recovery += 1
 
                 # During warmup: only update value head so it can calibrate on real game dynamics.
                 # Policy gradient is frozen — Stage 1 value head was trained on heuristic games and
@@ -619,6 +622,8 @@ def train(
                 clip_tag = f" | clip={clip_eps:.3f}[enc-frz]"
             else:
                 clip_tag = ""
+            if n_ent_recovery > 0:
+                clip_tag += f" | [rec={n_ent_recovery}mb]"
             print(
                 f"step={global_step:>9,}"
                 f" | win={recent_win:.3f}"

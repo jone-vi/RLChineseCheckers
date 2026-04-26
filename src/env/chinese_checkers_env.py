@@ -343,6 +343,13 @@ class ChineseCheckersEnv(gymnasium.Env):
                 r += 0.2
                 self._pins_entered_goal[colour].add(pin_id)
 
+        # 3. Revisit penalty: penalise returning to a previously-seen piece layout.
+        #    pos_count is per-player (own pieces only), so this fires only when THIS
+        #    player's pieces cycle back — not when the opponent causes a board repeat.
+        #    Capped at 3 visits to avoid overwhelming the win signal in heavy-cycle games.
+        if pos_count >= 2:
+            r -= 0.10 * min(pos_count - 1, 3)
+
         return r
 
     def _axial_dist_sq(self, idx: int, cq: float, cr: float) -> float:
