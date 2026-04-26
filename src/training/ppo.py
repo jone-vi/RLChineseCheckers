@@ -64,16 +64,21 @@ POLICY_RAMPUP_ROLLOUTS = 50  # rollouts after value warmup before encoder is unf
 ENT_COEF = 0.0               # Stage 1 already has sufficient diversity (ent≈0.13); no bonus needed.
                              # Any push toward exploration is pure instability when fine-tuning from
                              # a supervised prior — the policy should refine, not explore.
-ENT_PENALTY_COEF = 5.0       # at entropy=0.7 (above ceiling 0.60): penalty=5.0×0.10=0.50, which is
+ENT_PENALTY_COEF = 5.0       # at entropy=1.7 (above ceiling 1.5): penalty=5.0×0.20=1.0, which is
                              # 3-5× the typical policy_loss of 0.05-0.1 — strongly enforces the ceiling.
-MAX_ENT = 0.60               # hard ceiling; above this, recovery mode skips policy gradient entirely.
-                             # Raised from 0.35 to 0.60: the actual Stage 1 policy has ent≈1.77
-                             # (not the ent≈0.13 assumed in early comments). With MAX_ENT=0.35,
-                             # the first rollout after warmup has ent=0.62 > 0.35, firing recovery
-                             # on 11/16 minibatches and concentrating the policy on Stage 1's cyclic
-                             # high-probability actions before policy gradient can improve things.
-                             # At 0.60, recovery barely fires in rollout 1, then stops — leaving
-                             # policy gradient free to reinforce wins from rollout 2 onward.
+MAX_ENT = 1.5                # hard ceiling; above this, recovery mode skips policy gradient entirely.
+                             # Raised from 0.60 to 1.5: with WARMUP_ROLLOUTS=50 (51K steps), the policy
+                             # head has had no time to lower its Stage 1 entropy before policy updates
+                             # begin.  Measured post-warmup entropy is 1.07–1.65, so MAX_ENT=0.60
+                             # fires recovery on 11/16 minibatches from rollout 1 — identical to the
+                             # broken 0.35 setting.  Recovery concentrates the policy on Stage 1's
+                             # current high-probability actions (which include cyclic moves), causing
+                             # win→0% in 3 rollouts.  At 1.5, recovery only triggers if entropy
+                             # explosively increases above the Stage 1 baseline, which PPO with
+                             # KL stopping (TARGET_KL=0.01) and small initial clip (0.003) prevents.
+                             # Entropy decreases naturally toward 0.4–0.6 over 30–50 rollouts as the
+                             # policy learns to distinguish win vs cycle trajectories.  The floor (0.22)
+                             # still prevents collapse.
 ENT_FLOOR = 0.22             # minimum entropy (raised from 0.15); prevents the near-deterministic
                              # regime (ent≈0.13) where the masking nonlinearity is unstable.  The
                              # masking maps 1210 raw logits to ~50 valid actions; a tiny logit shift
