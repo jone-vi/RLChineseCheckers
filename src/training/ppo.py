@@ -117,7 +117,7 @@ WARMUP_ROLLOUTS = 50         # ~200K steps: freeze policy, let value head calibr
                              #     v_loss to spike — the head needs time to recalibrate on the new games
                              # (b) at 100 rollouts, v_loss was still 0.10+ when policy updates started,
                              #     producing noisy advantages that drove the entropy explosion
-CYCLE_TERMINAL_PENALTY = 0.0  # draw/cycle outcomes are scored by distance progress.
+CYCLE_TERMINAL_PENALTY = 1.0  # draw/cycle outcomes are scored by distance progress.
                               # In multiplayer, terminal cycle blame is usually non-local:
                               # a frozen opponent can trigger a repeat that the learner could
                               # not prevent.  Keep the targeted own-position revisit penalty in
