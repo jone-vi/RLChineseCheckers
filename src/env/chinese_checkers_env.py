@@ -389,7 +389,7 @@ class ChineseCheckersEnv(gymnasium.Env):
         #    no distribution shift when policy updates begin.  Cycling costs 0.005×N
         #    with zero distance benefit; forward moves offset the cost via shaping term 1.
         #    200 moves × 0.005 = 1.0 raw total ≈ 10% of the win bonus (10.0).
-        r -= 0.005
+        r -= 0.01
 
         return r
 

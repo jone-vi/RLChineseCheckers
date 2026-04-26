@@ -66,7 +66,7 @@ ENT_COEF = 0.0               # Stage 1 already has sufficient diversity (ent≈0
                              # a supervised prior — the policy should refine, not explore.
 ENT_PENALTY_COEF = 5.0       # at entropy=1.7 (above ceiling 1.5): penalty=5.0×0.20=1.0, which is
                              # 3-5× the typical policy_loss of 0.05-0.1 — strongly enforces the ceiling.
-MAX_ENT = 1.5                # hard ceiling; above this, recovery mode skips policy gradient entirely.
+MAX_ENT = 2.0                # hard ceiling; above this, recovery mode skips policy gradient entirely.
                              # Raised from 0.60 to 1.5: with WARMUP_ROLLOUTS=50 (51K steps), the policy
                              # head has had no time to lower its Stage 1 entropy before policy updates
                              # begin.  Measured post-warmup entropy is 1.07–1.65, so MAX_ENT=0.60
