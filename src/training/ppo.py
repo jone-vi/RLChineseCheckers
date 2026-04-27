@@ -141,9 +141,9 @@ EVAL_PLAYER_COUNTS = (2, 3, 4, 5, 6)
 PROMOTE_MIN_WIN_BY_COUNT = {2: 0.50, 3: 0.30, 4: 0.20, 5: 0.15, 6: 0.12}
 PROMOTE_MAX_DRAW_RATE = 0.25  # max(cycle + limit) for every evaluated player count.
 POST_PROMO_WARMUP = 20       # rollouts of value-head-only update after each pool promotion.
-PLAYER_MIX: dict[int, float] = {2: 0.35, 3: 0.13, 4: 0.20, 5: 0.12, 6: 0.20}
+PLAYER_MIX: dict[int, float] = {2: 0.20, 3: 0.10, 4: 0.25, 5: 0.20, 6: 0.25}
                                # distribution of N-player game counts per episode.
-                               # Tilted toward 2p (simple, strong win signal) and 4p/6p.
+                               # Tilted toward 4p-6p after 2p/3p became stable earlier in PPO.
                              # When a new checkpoint enters the pool, game dynamics shift suddenly:
                              # the learning policy now faces a competitive opponent, so typical
                              # returns drop (e.g. 0.99→0.50).  The value head, calibrated on the
