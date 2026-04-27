@@ -95,6 +95,13 @@ ENT_FLOOR_COEF = 3.0         # at ent=0.15 (below floor 0.22): penalty=3.0×0.07
 VF_COEF = 0.5
 LR = 3e-5                    # conservative LR preserves Stage 1 knowledge during fine-tuning
 POLICY_KL_COEF = 0.05        # keep PPO updates anchored to the Stage 1 supervised prior
+REF_KL_RECOVERY_THRESHOLD = 0.04
+                             # If the live policy drifts beyond this KL from Stage 1,
+                             # skip PPO policy gradients for that minibatch and pull
+                             # back toward the supervised prior. This prevents the
+                             # post-warmup ramp from converting noisy rollout advantages
+                             # into irreversible policy drift.
+REF_KL_RECOVERY_COEF = 1.0
 N_EPOCHS = 1                 # policy epochs per rollout — deliberately 1 to prevent large policy drift
 N_VALUE_EXTRA = 3            # additional value-head-only epochs per rollout (encoder+policy frozen).
                              # v_loss oscillated 0.07-0.17 throughout rampup because the policy changes every
@@ -749,6 +756,7 @@ def train(
         sum_policy_kl = 0.0
         n_updates = 0
         n_ent_recovery = 0   # minibatches that fired entropy recovery mode this rollout
+        n_ref_kl_recovery = 0 # minibatches that skipped PPO due to Stage 1 KL drift
         kl_exceeded = False
 
         in_warmup = rollout_count <= WARMUP_ROLLOUTS
@@ -823,6 +831,13 @@ def train(
                 in_ent_recovery = (not in_warmup) and (entropy_loss.item() > MAX_ENT)
                 if in_ent_recovery:
                     n_ent_recovery += 1
+                in_ref_kl_recovery = (
+                    (not in_warmup)
+                    and (not in_post_promo_warmup)
+                    and policy_kl.item() > REF_KL_RECOVERY_THRESHOLD
+                )
+                if in_ref_kl_recovery:
+                    n_ref_kl_recovery += 1
 
                 # During warmup: only update value head so it can calibrate on real game dynamics.
                 # Policy gradient is frozen — Stage 1 value head was trained on heuristic games and
@@ -834,6 +849,8 @@ def train(
                     loss = (ENT_PENALTY_COEF * torch.clamp(entropy_loss - MAX_ENT, min=0.0)
                             + POLICY_KL_COEF * policy_kl
                             + VF_COEF * value_loss)
+                elif in_ref_kl_recovery:
+                    loss = REF_KL_RECOVERY_COEF * policy_kl + ent_reg + VF_COEF * value_loss
                 else:
                     loss = policy_loss + VF_COEF * value_loss + ent_reg + POLICY_KL_COEF * policy_kl
 
@@ -918,6 +935,8 @@ def train(
                 clip_tag = ""
             if n_ent_recovery > 0:
                 clip_tag += f" | [rec={n_ent_recovery}mb]"
+            if n_ref_kl_recovery > 0:
+                clip_tag += f" | [ref-rec={n_ref_kl_recovery}mb]"
             hist_total = sum(n_players_hist.values())
             hist_str = (" | [" + " ".join(
                 f"{n}p:{c}" for n, c in sorted(n_players_hist.items()) if c > 0
